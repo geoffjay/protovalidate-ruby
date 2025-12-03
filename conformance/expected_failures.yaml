@@ -1,0 +1,11 @@
+# Expected conformance test failures for protovalidate-ruby
+#
+# This file lists test cases that are known to fail.
+# As the implementation matures, this list should be reduced.
+#
+# Format: List of test case paths that are expected to fail
+# Example:
+#   - standard_rules/well_known_types/duration
+#   - custom_rules/cel_expression
+
+# No expected failures yet - add as needed during conformance testing

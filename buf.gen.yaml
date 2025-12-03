@@ -8,3 +8,4 @@ plugins:
     out: gen
 inputs:
   - module: buf.build/bufbuild/protovalidate
+  - module: buf.build/bufbuild/protovalidate-testing

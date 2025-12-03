@@ -16,12 +16,21 @@ desc "Generate protobuf files from buf.build/bufbuild/protovalidate"
 task :proto do
   # Requires buf CLI to be installed
   # See: https://buf.build/docs/installation
-  sh "buf generate buf.build/bufbuild/protovalidate --path buf/validate"
+  sh "buf generate"
 end
 
-desc "Run conformance tests"
+desc "Run conformance tests using protovalidate-conformance tool"
 task :conformance do
-  ruby "conformance/runner.rb"
+  # Requires protovalidate-conformance tool to be installed
+  # See: https://github.com/bufbuild/protovalidate
+  expected_failures = File.exist?("conformance/expected_failures.yaml") ? "--expected_failures=conformance/expected_failures.yaml" : ""
+  sh "protovalidate-conformance #{expected_failures} -- bundle exec ruby conformance/runner.rb"
+end
+
+desc "Run conformance tests (verbose output)"
+task "conformance:verbose" do
+  expected_failures = File.exist?("conformance/expected_failures.yaml") ? "--expected_failures=conformance/expected_failures.yaml" : ""
+  sh "protovalidate-conformance --verbose #{expected_failures} -- bundle exec ruby conformance/runner.rb"
 end
 
 task default: %i[test rubocop]

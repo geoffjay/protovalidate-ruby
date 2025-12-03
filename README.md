@@ -69,6 +69,37 @@ Highlights include:
 - The [developer quickstart][quickstart]
 - A [migration guide for protoc-gen-validate][migration-guide] users
 
+## Development
+
+### Running Tests
+
+```shell
+bundle install
+bundle exec rake test
+```
+
+### Running Conformance Tests
+
+To run the official protovalidate conformance test suite, you need the `protovalidate-conformance` tool:
+
+```shell
+# Install the conformance tool (requires Go)
+go install github.com/bufbuild/protovalidate/tools/protovalidate-conformance@latest
+
+# Run conformance tests
+bundle exec rake conformance
+
+# Run with verbose output
+bundle exec rake conformance:verbose
+```
+
+### Regenerating Protobuf Files
+
+```shell
+# Requires buf CLI (https://buf.build/docs/installation)
+bundle exec rake proto
+```
+
 ## Additional languages and repositories
 
 Protovalidate isn't just for Ruby! You might be interested in sibling repositories for other languages:
