@@ -202,7 +202,11 @@ module Protovalidate
 
           # Check if any field in the oneof is set
           oneof_name = @oneof.name.to_sym
-          set_field = message.send(oneof_name) rescue nil
+          set_field = begin
+            message.send(oneof_name)
+          rescue StandardError
+            nil
+          end
 
           return if set_field
 
@@ -313,7 +317,7 @@ module Protovalidate
           context.with_field_path_element(field_elem) do
             violation = Violation.new(
               constraint_id: "any.in",
-              message: "type URL must be one of: #{@type_urls.to_a.join(', ')}"
+              message: "type URL must be one of: #{@type_urls.to_a.join(", ")}"
             )
             violation.field_value = type_url
             context.add(violation)
@@ -349,7 +353,7 @@ module Protovalidate
           context.with_field_path_element(field_elem) do
             violation = Violation.new(
               constraint_id: "any.not_in",
-              message: "type URL must not be one of: #{@type_urls.to_a.join(', ')}"
+              message: "type URL must not be one of: #{@type_urls.to_a.join(", ")}"
             )
             violation.field_value = type_url
             context.add(violation)
@@ -403,14 +407,14 @@ module Protovalidate
 
         def validate_item(context, item)
           # For message items, recursively validate
-          if item.respond_to?(:class) && item.class.respond_to?(:descriptor)
-            descriptor = item.class.descriptor
-            rules = @factory.get(descriptor)
+          return unless item.respond_to?(:class) && item.class.respond_to?(:descriptor)
 
-            rules.each do |rule|
-              rule.validate(context, item)
-              break if context.done?
-            end
+          descriptor = item.class.descriptor
+          rules = @factory.get(descriptor)
+
+          rules.each do |rule|
+            rule.validate(context, item)
+            break if context.done?
           end
         end
       end
@@ -509,14 +513,14 @@ module Protovalidate
 
         def validate_value(context, value)
           # For message values, recursively validate
-          if value.respond_to?(:class) && value.class.respond_to?(:descriptor)
-            descriptor = value.class.descriptor
-            rules = @factory.get(descriptor)
+          return unless value.respond_to?(:class) && value.class.respond_to?(:descriptor)
 
-            rules.each do |rule|
-              rule.validate(context, value)
-              break if context.done?
-            end
+          descriptor = value.class.descriptor
+          rules = @factory.get(descriptor)
+
+          rules.each do |rule|
+            rule.validate(context, value)
+            break if context.done?
           end
         end
 

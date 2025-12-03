@@ -63,8 +63,7 @@ module Protovalidate
       #
       # @return [ValidationContext]
       def sub_context
-        ctx = ValidationContext.new(fail_fast: fail_fast)
-        ctx
+        ValidationContext.new(fail_fast: fail_fast)
       end
 
       # Adds a field path element to the current path stack.
@@ -92,7 +91,7 @@ module Protovalidate
       # Finalizes violation paths by reversing the breadcrumb trail.
       def finalize_violations
         @violations.each do |violation|
-          violation.field_path&.elements&.reverse! if violation.field_path
+          violation.field_path&.elements&.reverse!
           violation.rule_path.reverse!
         end
       end

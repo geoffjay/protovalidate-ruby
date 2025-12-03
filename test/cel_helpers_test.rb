@@ -49,7 +49,7 @@ class CelHelpersTest < Minitest::Test
     refute valid_hostname?("")
     refute valid_hostname?("-invalid.com")
     refute valid_hostname?("invalid-.com")
-    refute valid_hostname?("a" * 64 + ".com") # Label too long
+    refute valid_hostname?("#{"a" * 64}.com") # Label too long
   end
 
   # IP address validation tests

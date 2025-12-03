@@ -53,12 +53,12 @@ class ViolationTest < Minitest::Test
 
   def test_violation_with_field_path
     field_path = Protovalidate::FieldPath.new([
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "email",
-        field_type: :string
-      )
-    ])
+                                                Protovalidate::FieldPathElement.new(
+                                                  field_number: 1,
+                                                  field_name: "email",
+                                                  field_type: :string
+                                                )
+                                              ])
 
     violation = Protovalidate::Violation.new(
       field_path: field_path,
@@ -73,67 +73,67 @@ end
 class FieldPathTest < Minitest::Test
   def test_simple_path
     path = Protovalidate::FieldPath.new([
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "user",
-        field_type: :message
-      )
-    ])
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "user",
+                                            field_type: :message
+                                          )
+                                        ])
 
     assert_equal "user", path.to_s
   end
 
   def test_nested_path
     path = Protovalidate::FieldPath.new([
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "user",
-        field_type: :message
-      ),
-      Protovalidate::FieldPathElement.new(
-        field_number: 2,
-        field_name: "email",
-        field_type: :string
-      )
-    ])
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "user",
+                                            field_type: :message
+                                          ),
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 2,
+                                            field_name: "email",
+                                            field_type: :string
+                                          )
+                                        ])
 
     assert_equal "user.email", path.to_s
   end
 
   def test_path_with_array_index
     path = Protovalidate::FieldPath.new([
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "items",
-        field_type: :message
-      ),
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "items",
-        field_type: :message,
-        subscript: 0,
-        subscript_type: :index
-      )
-    ])
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "items",
+                                            field_type: :message
+                                          ),
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "items",
+                                            field_type: :message,
+                                            subscript: 0,
+                                            subscript_type: :index
+                                          )
+                                        ])
 
     assert_equal "items[0]", path.to_s
   end
 
   def test_path_with_string_key
     path = Protovalidate::FieldPath.new([
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "map_field",
-        field_type: :message
-      ),
-      Protovalidate::FieldPathElement.new(
-        field_number: 1,
-        field_name: "map_field",
-        field_type: :message,
-        subscript: "key",
-        subscript_type: :string_key
-      )
-    ])
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "map_field",
+                                            field_type: :message
+                                          ),
+                                          Protovalidate::FieldPathElement.new(
+                                            field_number: 1,
+                                            field_name: "map_field",
+                                            field_type: :message,
+                                            subscript: "key",
+                                            subscript_type: :string_key
+                                          )
+                                        ])
 
     assert_equal "map_field[\"key\"]", path.to_s
   end

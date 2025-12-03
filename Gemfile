@@ -6,9 +6,7 @@ source "https://rubygems.org"
 gemspec
 
 # Use local cel-ruby if available
-if File.exist?(File.expand_path("contrib/cel-ruby", __dir__))
-  gem "cel", path: "contrib/cel-ruby"
-end
+gem "cel", path: "contrib/cel-ruby" if File.exist?(File.expand_path("contrib/cel-ruby", __dir__))
 
 group :development do
   gem "minitest", "~> 5.0"

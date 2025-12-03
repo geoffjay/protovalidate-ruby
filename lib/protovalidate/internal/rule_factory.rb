@@ -31,7 +31,7 @@ module Protovalidate
             rules = compile_rules(descriptor)
             @cache[full_name] = rules
             rules
-          rescue => e
+          rescue StandardError => e
             # Cache compilation errors to avoid retrying
             @cache[full_name] = e
             raise CompilationError.new("Failed to compile rules for #{full_name}", cause: e)
@@ -164,14 +164,12 @@ module Protovalidate
         end
 
         # Handle repeated fields
-        if field.label == :repeated && !field.map?
-          rules.concat(compile_repeated_rules(field, constraint.repeated, ignore)) if constraint.repeated
+        if field.label == :repeated && !field.map? && constraint.repeated
+          rules.concat(compile_repeated_rules(field, constraint.repeated, ignore))
         end
 
         # Handle map fields
-        if field.map?
-          rules.concat(compile_map_rules(field, constraint.map, ignore)) if constraint.map
-        end
+        rules.concat(compile_map_rules(field, constraint.map, ignore)) if field.map? && constraint.map
 
         rules
       end
@@ -180,54 +178,68 @@ module Protovalidate
         rules = []
 
         # Standard string validations compiled to CEL
-        if string_rules.min_len && string_rules.min_len > 0
+        if string_rules.min_len&.positive?
           rules << build_cel_rule(field, "size(this) >= #{string_rules.min_len}", ignore,
-            "string.min_len", "value length must be at least #{string_rules.min_len} characters")
+                                  "string.min_len", "value length must be at least #{string_rules.min_len} characters")
         end
 
-        if string_rules.max_len && string_rules.max_len > 0
+        if string_rules.max_len&.positive?
           rules << build_cel_rule(field, "size(this) <= #{string_rules.max_len}", ignore,
-            "string.max_len", "value length must be at most #{string_rules.max_len} characters")
+                                  "string.max_len", "value length must be at most #{string_rules.max_len} characters")
         end
 
-        if string_rules.len && string_rules.len > 0
+        if string_rules.len&.positive?
           rules << build_cel_rule(field, "size(this) == #{string_rules.len}", ignore,
-            "string.len", "value length must be #{string_rules.len} characters")
+                                  "string.len", "value length must be #{string_rules.len} characters")
         end
 
         if string_rules.pattern && !string_rules.pattern.empty?
           escaped = string_rules.pattern.gsub("\\", "\\\\\\\\").gsub('"', '\\"')
           rules << build_cel_rule(field, "this.matches(\"#{escaped}\")", ignore,
-            "string.pattern", "value must match pattern '#{string_rules.pattern}'")
+                                  "string.pattern", "value must match pattern '#{string_rules.pattern}'")
         end
 
         # Well-known string formats
-        rules << build_cel_rule(field, "this.isEmail()", ignore,
-          "string.email", "value must be a valid email address") if string_rules.email
+        if string_rules.email
+          rules << build_cel_rule(field, "this.isEmail()", ignore,
+                                  "string.email", "value must be a valid email address")
+        end
 
-        rules << build_cel_rule(field, "this.isUri()", ignore,
-          "string.uri", "value must be a valid URI") if string_rules.uri
+        if string_rules.uri
+          rules << build_cel_rule(field, "this.isUri()", ignore,
+                                  "string.uri", "value must be a valid URI")
+        end
 
-        rules << build_cel_rule(field, "this.isUriRef()", ignore,
-          "string.uri_ref", "value must be a valid URI reference") if string_rules.uri_ref
+        if string_rules.uri_ref
+          rules << build_cel_rule(field, "this.isUriRef()", ignore,
+                                  "string.uri_ref", "value must be a valid URI reference")
+        end
 
-        rules << build_cel_rule(field, "this.isHostname()", ignore,
-          "string.hostname", "value must be a valid hostname") if string_rules.hostname
+        if string_rules.hostname
+          rules << build_cel_rule(field, "this.isHostname()", ignore,
+                                  "string.hostname", "value must be a valid hostname")
+        end
 
-        rules << build_cel_rule(field, "this.isIp()", ignore,
-          "string.ip", "value must be a valid IP address") if string_rules.ip
+        if string_rules.ip
+          rules << build_cel_rule(field, "this.isIp()", ignore,
+                                  "string.ip", "value must be a valid IP address")
+        end
 
-        rules << build_cel_rule(field, "this.isIp(4)", ignore,
-          "string.ipv4", "value must be a valid IPv4 address") if string_rules.ipv4
+        if string_rules.ipv4
+          rules << build_cel_rule(field, "this.isIp(4)", ignore,
+                                  "string.ipv4", "value must be a valid IPv4 address")
+        end
 
-        rules << build_cel_rule(field, "this.isIp(6)", ignore,
-          "string.ipv6", "value must be a valid IPv6 address") if string_rules.ipv6
+        if string_rules.ipv6
+          rules << build_cel_rule(field, "this.isIp(6)", ignore,
+                                  "string.ipv6", "value must be a valid IPv6 address")
+        end
 
         # UUID validation
         if string_rules.uuid
           uuid_pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
           rules << build_cel_rule(field, "this.matches(\"#{uuid_pattern}\")", ignore,
-            "string.uuid", "value must be a valid UUID")
+                                  "string.uuid", "value must be a valid UUID")
         end
 
         rules.compact
@@ -236,19 +248,19 @@ module Protovalidate
       def compile_bytes_rules(field, bytes_rules, ignore)
         rules = []
 
-        if bytes_rules.min_len && bytes_rules.min_len > 0
+        if bytes_rules.min_len&.positive?
           rules << build_cel_rule(field, "size(this) >= #{bytes_rules.min_len}", ignore,
-            "bytes.min_len", "value length must be at least #{bytes_rules.min_len} bytes")
+                                  "bytes.min_len", "value length must be at least #{bytes_rules.min_len} bytes")
         end
 
-        if bytes_rules.max_len && bytes_rules.max_len > 0
+        if bytes_rules.max_len&.positive?
           rules << build_cel_rule(field, "size(this) <= #{bytes_rules.max_len}", ignore,
-            "bytes.max_len", "value length must be at most #{bytes_rules.max_len} bytes")
+                                  "bytes.max_len", "value length must be at most #{bytes_rules.max_len} bytes")
         end
 
-        if bytes_rules.len && bytes_rules.len > 0
+        if bytes_rules.len&.positive?
           rules << build_cel_rule(field, "size(this) == #{bytes_rules.len}", ignore,
-            "bytes.len", "value length must be #{bytes_rules.len} bytes")
+                                  "bytes.len", "value length must be #{bytes_rules.len} bytes")
         end
 
         rules.compact
@@ -259,39 +271,46 @@ module Protovalidate
         int_rules = case field.type
                     when :int32, :sint32, :sfixed32 then constraint.int32
                     when :int64, :sint64, :sfixed64 then constraint.int64
-                    else nil
                     end
         return rules unless int_rules
 
         type_name = field.type.to_s
 
-        rules << build_cel_rule(field, "this > #{int_rules.gt}", ignore,
-          "#{type_name}.gt", "value must be greater than #{int_rules.gt}") if int_rules.gt
+        if int_rules.gt
+          rules << build_cel_rule(field, "this > #{int_rules.gt}", ignore,
+                                  "#{type_name}.gt", "value must be greater than #{int_rules.gt}")
+        end
 
-        rules << build_cel_rule(field, "this >= #{int_rules.gte}", ignore,
-          "#{type_name}.gte", "value must be greater than or equal to #{int_rules.gte}") if int_rules.gte
+        if int_rules.gte
+          rules << build_cel_rule(field, "this >= #{int_rules.gte}", ignore,
+                                  "#{type_name}.gte", "value must be greater than or equal to #{int_rules.gte}")
+        end
 
-        rules << build_cel_rule(field, "this < #{int_rules.lt}", ignore,
-          "#{type_name}.lt", "value must be less than #{int_rules.lt}") if int_rules.lt
+        if int_rules.lt
+          rules << build_cel_rule(field, "this < #{int_rules.lt}", ignore,
+                                  "#{type_name}.lt", "value must be less than #{int_rules.lt}")
+        end
 
-        rules << build_cel_rule(field, "this <= #{int_rules.lte}", ignore,
-          "#{type_name}.lte", "value must be less than or equal to #{int_rules.lte}") if int_rules.lte
+        if int_rules.lte
+          rules << build_cel_rule(field, "this <= #{int_rules.lte}", ignore,
+                                  "#{type_name}.lte", "value must be less than or equal to #{int_rules.lte}")
+        end
 
         if int_rules.const
           rules << build_cel_rule(field, "this == #{int_rules.const}", ignore,
-            "#{type_name}.const", "value must equal #{int_rules.const}")
+                                  "#{type_name}.const", "value must equal #{int_rules.const}")
         end
 
         if int_rules.in && !int_rules.in.empty?
           in_list = int_rules.in.join(", ")
           rules << build_cel_rule(field, "this in [#{in_list}]", ignore,
-            "#{type_name}.in", "value must be in [#{in_list}]")
+                                  "#{type_name}.in", "value must be in [#{in_list}]")
         end
 
         if int_rules.not_in && !int_rules.not_in.empty?
           not_in_list = int_rules.not_in.join(", ")
           rules << build_cel_rule(field, "!(this in [#{not_in_list}])", ignore,
-            "#{type_name}.not_in", "value must not be in [#{not_in_list}]")
+                                  "#{type_name}.not_in", "value must not be in [#{not_in_list}]")
         end
 
         rules.compact
@@ -302,23 +321,30 @@ module Protovalidate
         uint_rules = case field.type
                      when :uint32, :fixed32 then constraint.uint32
                      when :uint64, :fixed64 then constraint.uint64
-                     else nil
                      end
         return rules unless uint_rules
 
         type_name = field.type.to_s
 
-        rules << build_cel_rule(field, "this > uint(#{uint_rules.gt})", ignore,
-          "#{type_name}.gt", "value must be greater than #{uint_rules.gt}") if uint_rules.gt
+        if uint_rules.gt
+          rules << build_cel_rule(field, "this > uint(#{uint_rules.gt})", ignore,
+                                  "#{type_name}.gt", "value must be greater than #{uint_rules.gt}")
+        end
 
-        rules << build_cel_rule(field, "this >= uint(#{uint_rules.gte})", ignore,
-          "#{type_name}.gte", "value must be greater than or equal to #{uint_rules.gte}") if uint_rules.gte
+        if uint_rules.gte
+          rules << build_cel_rule(field, "this >= uint(#{uint_rules.gte})", ignore,
+                                  "#{type_name}.gte", "value must be greater than or equal to #{uint_rules.gte}")
+        end
 
-        rules << build_cel_rule(field, "this < uint(#{uint_rules.lt})", ignore,
-          "#{type_name}.lt", "value must be less than #{uint_rules.lt}") if uint_rules.lt
+        if uint_rules.lt
+          rules << build_cel_rule(field, "this < uint(#{uint_rules.lt})", ignore,
+                                  "#{type_name}.lt", "value must be less than #{uint_rules.lt}")
+        end
 
-        rules << build_cel_rule(field, "this <= uint(#{uint_rules.lte})", ignore,
-          "#{type_name}.lte", "value must be less than or equal to #{uint_rules.lte}") if uint_rules.lte
+        if uint_rules.lte
+          rules << build_cel_rule(field, "this <= uint(#{uint_rules.lte})", ignore,
+                                  "#{type_name}.lte", "value must be less than or equal to #{uint_rules.lte}")
+        end
 
         rules.compact
       end
@@ -328,23 +354,30 @@ module Protovalidate
         float_rules = case field.type
                       when :float then constraint.float
                       when :double then constraint.double
-                      else nil
                       end
         return rules unless float_rules
 
         type_name = field.type.to_s
 
-        rules << build_cel_rule(field, "this > #{float_rules.gt}", ignore,
-          "#{type_name}.gt", "value must be greater than #{float_rules.gt}") if float_rules.gt
+        if float_rules.gt
+          rules << build_cel_rule(field, "this > #{float_rules.gt}", ignore,
+                                  "#{type_name}.gt", "value must be greater than #{float_rules.gt}")
+        end
 
-        rules << build_cel_rule(field, "this >= #{float_rules.gte}", ignore,
-          "#{type_name}.gte", "value must be greater than or equal to #{float_rules.gte}") if float_rules.gte
+        if float_rules.gte
+          rules << build_cel_rule(field, "this >= #{float_rules.gte}", ignore,
+                                  "#{type_name}.gte", "value must be greater than or equal to #{float_rules.gte}")
+        end
 
-        rules << build_cel_rule(field, "this < #{float_rules.lt}", ignore,
-          "#{type_name}.lt", "value must be less than #{float_rules.lt}") if float_rules.lt
+        if float_rules.lt
+          rules << build_cel_rule(field, "this < #{float_rules.lt}", ignore,
+                                  "#{type_name}.lt", "value must be less than #{float_rules.lt}")
+        end
 
-        rules << build_cel_rule(field, "this <= #{float_rules.lte}", ignore,
-          "#{type_name}.lte", "value must be less than or equal to #{float_rules.lte}") if float_rules.lte
+        if float_rules.lte
+          rules << build_cel_rule(field, "this <= #{float_rules.lte}", ignore,
+                                  "#{type_name}.lte", "value must be less than or equal to #{float_rules.lte}")
+        end
 
         rules.compact
       end
@@ -354,7 +387,7 @@ module Protovalidate
 
         unless bool_rules.const.nil?
           rules << build_cel_rule(field, "this == #{bool_rules.const}", ignore,
-            "bool.const", "value must be #{bool_rules.const}")
+                                  "bool.const", "value must be #{bool_rules.const}")
         end
 
         rules.compact
@@ -373,13 +406,13 @@ module Protovalidate
         if enum_rules.in && !enum_rules.in.empty?
           in_list = enum_rules.in.join(", ")
           rules << build_cel_rule(field, "int(this) in [#{in_list}]", ignore,
-            "enum.in", "value must be in [#{in_list}]")
+                                  "enum.in", "value must be in [#{in_list}]")
         end
 
         if enum_rules.not_in && !enum_rules.not_in.empty?
           not_in_list = enum_rules.not_in.join(", ")
           rules << build_cel_rule(field, "!(int(this) in [#{not_in_list}])", ignore,
-            "enum.not_in", "value must not be in [#{not_in_list}]")
+                                  "enum.not_in", "value must not be in [#{not_in_list}]")
         end
 
         rules.compact
@@ -432,36 +465,34 @@ module Protovalidate
         rules
       end
 
-      def compile_duration_rules(field, duration_rules, ignore)
-        rules = []
+      def compile_duration_rules(_field, _duration_rules, _ignore)
+        []
         # Duration validation rules would be compiled here
         # For now, return empty - to be implemented
-        rules
       end
 
-      def compile_timestamp_rules(field, timestamp_rules, ignore)
-        rules = []
+      def compile_timestamp_rules(_field, _timestamp_rules, _ignore)
+        []
         # Timestamp validation rules would be compiled here
         # For now, return empty - to be implemented
-        rules
       end
 
       def compile_repeated_rules(field, repeated_rules, ignore)
         rules = []
 
-        if repeated_rules.min_items && repeated_rules.min_items > 0
+        if repeated_rules.min_items&.positive?
           rules << build_cel_rule(field, "size(this) >= #{repeated_rules.min_items}", ignore,
-            "repeated.min_items", "value must contain at least #{repeated_rules.min_items} items")
+                                  "repeated.min_items", "value must contain at least #{repeated_rules.min_items} items")
         end
 
-        if repeated_rules.max_items && repeated_rules.max_items > 0
+        if repeated_rules.max_items&.positive?
           rules << build_cel_rule(field, "size(this) <= #{repeated_rules.max_items}", ignore,
-            "repeated.max_items", "value must contain at most #{repeated_rules.max_items} items")
+                                  "repeated.max_items", "value must contain at most #{repeated_rules.max_items} items")
         end
 
         if repeated_rules.unique
           rules << build_cel_rule(field, "this.unique()", ignore,
-            "repeated.unique", "value must contain unique items")
+                                  "repeated.unique", "value must contain unique items")
         end
 
         # Item-level rules would be applied to each element
@@ -480,14 +511,14 @@ module Protovalidate
       def compile_map_rules(field, map_rules, ignore)
         rules = []
 
-        if map_rules.min_pairs && map_rules.min_pairs > 0
+        if map_rules.min_pairs&.positive?
           rules << build_cel_rule(field, "size(this) >= #{map_rules.min_pairs}", ignore,
-            "map.min_pairs", "value must contain at least #{map_rules.min_pairs} pairs")
+                                  "map.min_pairs", "value must contain at least #{map_rules.min_pairs} pairs")
         end
 
-        if map_rules.max_pairs && map_rules.max_pairs > 0
+        if map_rules.max_pairs&.positive?
           rules << build_cel_rule(field, "size(this) <= #{map_rules.max_pairs}", ignore,
-            "map.max_pairs", "value must contain at most #{map_rules.max_pairs} pairs")
+                                  "map.max_pairs", "value must contain at most #{map_rules.max_pairs} pairs")
         end
 
         # Key and value rules
@@ -527,11 +558,11 @@ module Protovalidate
           cel_env: @cel_env,
           ignore: ignore
         )
-      rescue => e
+      rescue StandardError => e
         raise CompilationError.new("Failed to compile CEL expression '#{expression}': #{e.message}", cause: e)
       end
 
-      def compile_cel_expression(expression, context, type)
+      def compile_cel_expression(expression, _context, _type)
         @cel_env.program(expression)
       rescue Cel::ParseError, Cel::CheckError => e
         raise CompilationError.new("Invalid CEL expression '#{expression}': #{e.message}", cause: e)

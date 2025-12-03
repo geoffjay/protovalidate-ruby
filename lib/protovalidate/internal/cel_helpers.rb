@@ -20,12 +20,16 @@ module Protovalidate
             isIp: Cel::Function(:string, return_type: :bool) { |s| valid_ip?(s.to_s) },
             "isIp.version": Cel::Function(:string, :int, return_type: :bool) { |s, v| valid_ip?(s.to_s, v.to_i) },
             isIpPrefix: Cel::Function(:string, return_type: :bool) { |s| valid_ip_prefix?(s.to_s) },
-            isHostAndPort: Cel::Function(:string, :bool, return_type: :bool) { |s, req| valid_host_and_port?(s.to_s, req) },
+            isHostAndPort: Cel::Function(:string, :bool, return_type: :bool) do |s, req|
+              valid_host_and_port?(s.to_s, req)
+            end,
 
             # Number validation functions
             isNan: Cel::Function(:double, return_type: :bool) { |n| n.to_f.nan? },
-            isInf: Cel::Function(:double, return_type: :bool) { |n| n.to_f.infinite? != nil },
-            "isInf.sign": Cel::Function(:double, :int, return_type: :bool) { |n, sign| check_infinity?(n.to_f, sign.to_i) },
+            isInf: Cel::Function(:double, return_type: :bool) { |n| !n.to_f.infinite?.nil? },
+            "isInf.sign": Cel::Function(:double, :int, return_type: :bool) do |n, sign|
+              check_infinity?(n.to_f, sign.to_i)
+            end,
 
             # Collection functions
             unique: Cel::Function(Cel::TYPES[:list, :any], return_type: :bool) { |list| list_unique?(list) }
@@ -91,7 +95,7 @@ module Protovalidate
           return false if str.empty?
 
           # HTML5 email validation pattern (simplified)
-          pattern = /\A[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z/
+          pattern = %r{\A[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z}
           str.match?(pattern)
         end
 
@@ -160,15 +164,15 @@ module Protovalidate
             case version
             when 4
               return false unless addr.ipv4?
-              return false if prefix_len < 0 || prefix_len > 32
+              return false if prefix_len.negative? || prefix_len > 32
             when 6
               return false unless addr.ipv6?
-              return false if prefix_len < 0 || prefix_len > 128
+              return false if prefix_len.negative? || prefix_len > 128
             else
               if addr.ipv4?
-                return false if prefix_len < 0 || prefix_len > 32
-              else
-                return false if prefix_len < 0 || prefix_len > 128
+                return false if prefix_len.negative? || prefix_len > 32
+              elsif prefix_len.negative? || prefix_len > 128
+                return false
               end
             end
 
@@ -222,7 +226,7 @@ module Protovalidate
           return false unless port_str.match?(/\A\d+\z/)
 
           port = port_str.to_i
-          port >= 0 && port <= 65535
+          port.between?(0, 65_535)
         end
 
         def check_infinity?(value, sign)

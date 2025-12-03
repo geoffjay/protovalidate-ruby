@@ -43,7 +43,7 @@ module Protovalidate
       private
 
       def print_summary
-        puts "\n" + "=" * 40
+        puts "\n#{"=" * 40}"
         puts "Summary:"
         puts "  Passed:  #{@passed}"
         puts "  Failed:  #{@failed}"
@@ -56,6 +56,4 @@ module Protovalidate
   end
 end
 
-if __FILE__ == $PROGRAM_NAME
-  Protovalidate::Conformance::Runner.new.run
-end
+Protovalidate::Conformance::Runner.new.run if __FILE__ == $PROGRAM_NAME
