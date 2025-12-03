@@ -59,6 +59,24 @@ module Protovalidate
       def compile_rules(descriptor)
         rules = []
 
+        # Build a map of field name -> oneof name for implicit ignore handling (protobuf oneofs)
+        oneof_map = {}
+        descriptor.each_oneof do |oneof|
+          oneof.each do |field|
+            oneof_map[field.name] = oneof.name
+          end
+        end
+
+        # Also track fields that are part of message-level oneof constraints
+        # These fields should have implicit IGNORE_IF_UNPOPULATED behavior
+        message_oneof_fields = Set.new
+        message_constraint = ConstraintResolver.resolve_message_constraints(descriptor)
+        if message_constraint&.respond_to?(:oneof) && message_constraint.oneof
+          message_constraint.oneof.each do |oneof_rule|
+            oneof_rule.fields.each { |f| message_oneof_fields << f }
+          end
+        end
+
         # Compile message-level rules
         message_rules = compile_message_rules(descriptor)
         rules.concat(message_rules)
@@ -71,7 +89,7 @@ module Protovalidate
 
         # Compile field rules
         descriptor.each do |field|
-          field_rules = compile_field_rules(field)
+          field_rules = compile_field_rules(field, oneof_map, message_oneof_fields)
           rules.concat(field_rules)
         end
 
@@ -94,6 +112,40 @@ module Protovalidate
           )
         end
 
+        # Compile message-level oneof rules
+        if constraint.respond_to?(:oneof) && constraint.oneof
+          constraint.oneof.each do |oneof_rule|
+            # Validate that all fields exist
+            fields = oneof_rule.fields.to_a
+            fields.each do |field_name|
+              found = false
+              descriptor.each do |field|
+                if field.name == field_name
+                  found = true
+                  break
+                end
+              end
+              unless found
+                raise CompilationError.new("field #{field_name} not found in message #{descriptor.name}")
+              end
+            end
+
+            # Validate at least one field is specified
+            if fields.empty?
+              raise CompilationError.new("at least one field must be specified in oneof rule for the message #{descriptor.name}")
+            end
+
+            # Check for duplicate fields across all oneof rules
+            # (we validate this per-rule for now)
+
+            rules << Rules::MessageOneofRule.new(
+              fields: fields,
+              required: oneof_rule.required,
+              descriptor: descriptor
+            )
+          end
+        end
+
         rules
       end
 
@@ -113,7 +165,7 @@ module Protovalidate
         rules
       end
 
-      def compile_field_rules(field)
+      def compile_field_rules(field, oneof_map = {}, message_oneof_fields = Set.new)
         rules = []
 
         constraint = ConstraintResolver.resolve_field_constraints(field)
@@ -121,6 +173,15 @@ module Protovalidate
 
         # Handle ignore conditions
         ignore = constraint.ignore || :IGNORE_UNSPECIFIED
+
+        # For fields that are part of a message-level oneof, apply implicit ignore
+        # unless they have an explicit ignore setting
+        if message_oneof_fields.include?(field.name) && ignore == :IGNORE_UNSPECIFIED
+          ignore = :IGNORE_IF_UNPOPULATED
+        end
+
+        # Check if field belongs to a protobuf oneof (use the map passed from compile_rules)
+        oneof_name = oneof_map[field.name]
 
         # Required constraint
         if constraint.required
@@ -138,36 +199,37 @@ module Protovalidate
             program: program,
             rule: cel_rule,
             cel_env: @cel_env,
-            ignore: ignore
+            ignore: ignore,
+            oneof_name: oneof_name
           )
         end
 
         # Type-specific rules
-        type_rules = compile_type_specific_rules(field, constraint, ignore)
+        type_rules = compile_type_specific_rules(field, constraint, ignore, oneof_name)
         rules.concat(type_rules)
 
         rules
       end
 
-      def compile_type_specific_rules(field, constraint, ignore)
+      def compile_type_specific_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
         is_map = map_field?(field)
 
         case field.type
         when :string
-          rules.concat(compile_string_rules(field, constraint.string, ignore)) if constraint.string
+          rules.concat(compile_string_rules(field, constraint.string, ignore, oneof_name)) if constraint.string
         when :bytes
-          rules.concat(compile_bytes_rules(field, constraint.bytes, ignore)) if constraint.bytes
+          rules.concat(compile_bytes_rules(field, constraint.bytes, ignore, oneof_name)) if constraint.bytes
         when :int32, :int64, :sint32, :sint64, :sfixed32, :sfixed64
-          rules.concat(compile_int_rules(field, constraint, ignore))
+          rules.concat(compile_int_rules(field, constraint, ignore, oneof_name))
         when :uint32, :uint64, :fixed32, :fixed64
-          rules.concat(compile_uint_rules(field, constraint, ignore))
+          rules.concat(compile_uint_rules(field, constraint, ignore, oneof_name))
         when :float, :double
-          rules.concat(compile_float_rules(field, constraint, ignore))
+          rules.concat(compile_float_rules(field, constraint, ignore, oneof_name))
         when :bool
-          rules.concat(compile_bool_rules(field, constraint.bool, ignore)) if constraint.bool
+          rules.concat(compile_bool_rules(field, constraint.bool, ignore, oneof_name)) if constraint.bool
         when :enum
-          rules.concat(compile_enum_rules(field, constraint.enum, ignore)) if constraint.enum
+          rules.concat(compile_enum_rules(field, constraint.enum, ignore, oneof_name)) if constraint.enum
         when :message
           rules.concat(compile_message_field_rules(field, constraint, ignore)) unless is_map
         end
@@ -202,7 +264,7 @@ module Protovalidate
         has_key && has_value
       end
 
-      def compile_string_rules(field, string_rules, ignore)
+      def compile_string_rules(field, string_rules, ignore, _oneof_name = nil)
         rules = []
 
         # Const
@@ -280,7 +342,7 @@ module Protovalidate
         rules
       end
 
-      def compile_bytes_rules(field, bytes_rules, ignore)
+      def compile_bytes_rules(field, bytes_rules, ignore, _oneof_name = nil)
         rules = []
 
         # Const
@@ -339,7 +401,7 @@ module Protovalidate
       # Compiles numeric range rules, handling combined gt/lt/gte/lte bounds.
       # Returns a combined rule when both lower and upper bounds are set,
       # or individual rules when only one bound is set.
-      def compile_numeric_range_rules(field, num_rules, ignore, type_name)
+      def compile_numeric_range_rules(field, num_rules, ignore, type_name, _oneof_name = nil)
         rules = []
 
         has_gt = num_rules.has_gt?
@@ -409,7 +471,7 @@ module Protovalidate
         rules
       end
 
-      def compile_int_rules(field, constraint, ignore)
+      def compile_int_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
         int_rules = case field.type
                     when :int32 then constraint.int32
@@ -424,7 +486,7 @@ module Protovalidate
         type_name = field.type.to_s
 
         # Handle combined range rules
-        rules.concat(compile_numeric_range_rules(field, int_rules, ignore, type_name))
+        rules.concat(compile_numeric_range_rules(field, int_rules, ignore, type_name, oneof_name))
 
         if int_rules.has_const?
           rules << Rules::NumericConstRule.new(field: field, const: int_rules.const, ignore: ignore,
@@ -444,7 +506,7 @@ module Protovalidate
         rules
       end
 
-      def compile_uint_rules(field, constraint, ignore)
+      def compile_uint_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
         uint_rules = case field.type
                      when :uint32 then constraint.uint32
@@ -457,7 +519,7 @@ module Protovalidate
         type_name = field.type.to_s
 
         # Handle combined range rules
-        rules.concat(compile_numeric_range_rules(field, uint_rules, ignore, type_name))
+        rules.concat(compile_numeric_range_rules(field, uint_rules, ignore, type_name, oneof_name))
 
         if uint_rules.has_const?
           rules << Rules::NumericConstRule.new(field: field, const: uint_rules.const, ignore: ignore,
@@ -477,7 +539,7 @@ module Protovalidate
         rules
       end
 
-      def compile_float_rules(field, constraint, ignore)
+      def compile_float_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
         float_rules = case field.type
                       when :float then constraint.float
@@ -488,7 +550,7 @@ module Protovalidate
         type_name = field.type.to_s
 
         # Handle combined range rules
-        rules.concat(compile_numeric_range_rules(field, float_rules, ignore, type_name))
+        rules.concat(compile_numeric_range_rules(field, float_rules, ignore, type_name, oneof_name))
 
         if float_rules.has_const?
           rules << Rules::NumericConstRule.new(field: field, const: float_rules.const, ignore: ignore,
@@ -510,17 +572,17 @@ module Protovalidate
         rules
       end
 
-      def compile_bool_rules(field, bool_rules, ignore)
+      def compile_bool_rules(field, bool_rules, ignore, oneof_name = nil)
         rules = []
 
         if bool_rules.has_const?
-          rules << Rules::BoolConstRule.new(field: field, const: bool_rules.const, ignore: ignore)
+          rules << Rules::BoolConstRule.new(field: field, const: bool_rules.const, ignore: ignore, oneof_name: oneof_name)
         end
 
         rules
       end
 
-      def compile_enum_rules(field, enum_rules, ignore)
+      def compile_enum_rules(field, enum_rules, ignore, _oneof_name = nil)
         rules = []
 
         # const rule

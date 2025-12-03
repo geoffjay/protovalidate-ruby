@@ -234,17 +234,24 @@ module Protovalidate
 
       # Validates a CEL expression at the field level.
       class FieldCelRule < Base
-        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED)
+        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, oneof_name: nil)
           super()
           @field = field
           @program = program
           @rule = rule
           @cel_env = cel_env
           @ignore = ignore
+          @oneof_name = oneof_name
         end
 
         def validate(context, message)
           return if context.done?
+
+          # For oneof members, skip validation if not the selected field
+          if @oneof_name
+            selected = message.send(@oneof_name) rescue nil
+            return unless selected&.to_s == @field.name
+          end
 
           value = message.send(@field.name)
 
@@ -303,7 +310,8 @@ module Protovalidate
           case value
           when String then value.empty?
           when Numeric then value.zero?
-          when TrueClass, FalseClass then false # booleans are never "empty"
+          when FalseClass then true # false is the zero/default value for booleans
+          when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
           else
@@ -374,7 +382,8 @@ module Protovalidate
           case value
           when String then value.empty?
           when Numeric then value.zero?
-          when TrueClass, FalseClass then false
+          when FalseClass then true # false is the default/zero value for booleans
+          when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
           else
@@ -383,7 +392,7 @@ module Protovalidate
         end
       end
 
-      # Validates that a oneof field is set.
+      # Validates that a oneof field is set (for protobuf oneof declarations).
       class OneofRequiredRule < Base
         def initialize(oneof:, constraint:)
           super()
@@ -404,11 +413,101 @@ module Protovalidate
 
           return if set_field
 
-          violation = Violation.new(
-            constraint_id: "oneof.required",
-            message: "exactly one field must be set in oneof '#{@oneof.name}'"
+          # Build field path element for the oneof
+          field_elem = FieldPathElement.new(
+            field_number: 0,
+            field_name: @oneof.name,
+            field_type: nil
           )
-          context.add(violation)
+
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: "required",
+              message: "exactly one field is required in oneof"
+            )
+            context.add(violation)
+          end
+        end
+      end
+
+      # Validates message-level oneof constraints.
+      # These are specified via MessageRules.oneof and are different from protobuf oneofs.
+      class MessageOneofRule < Base
+        def initialize(fields:, required:, descriptor:)
+          super()
+          @fields = fields
+          @required = required
+          @descriptor = descriptor
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          # Count how many of the specified fields are set
+          set_count = 0
+          set_fields = []
+
+          @fields.each do |field_name|
+            field = find_field(field_name)
+            next unless field
+
+            if field_is_set?(message, field)
+              set_count += 1
+              set_fields << field_name
+            end
+          end
+
+          # Validate based on the constraint
+          if @required && set_count == 0
+            # Required but none set
+            violation = Violation.new(
+              constraint_id: "message.oneof",
+              message: "one of #{@fields.join(", ")} must be set"
+            )
+            context.add(violation)
+          elsif set_count > 1
+            # More than one set - always invalid for oneof
+            violation = Violation.new(
+              constraint_id: "message.oneof",
+              message: "only one of #{set_fields.join(", ")} can be set"
+            )
+            context.add(violation)
+          end
+        end
+
+        private
+
+        def find_field(field_name)
+          @descriptor.each do |field|
+            return field if field.name == field_name
+          end
+          nil
+        end
+
+        def field_is_set?(message, field)
+          # Check if field has presence tracking
+          if message.respond_to?("has_#{field.name}?")
+            return message.send("has_#{field.name}?")
+          end
+
+          value = message.send(field.name)
+          return false if value.nil?
+
+          case field.type
+          when :message
+            # Messages are set if not nil
+            true
+          when :string
+            !value.empty?
+          when :bytes
+            !value.empty?
+          when :bool
+            # For message-level oneofs with implicit presence, false (default) means not set
+            value == true
+          else
+            # Numbers: 0 is considered not set for synthetic oneofs
+            !value.zero?
+          end
         end
       end
 
@@ -897,17 +996,24 @@ module Protovalidate
 
       # Base class for direct field validation rules (not using CEL).
       class DirectFieldRule < Base
-        def initialize(field:, constraint_id:, message:, ignore: :IGNORE_UNSPECIFIED, rule_path: [])
+        def initialize(field:, constraint_id:, message:, ignore: :IGNORE_UNSPECIFIED, rule_path: [], oneof_name: nil)
           super()
           @field = field
           @ignore = ignore
           @constraint_id = constraint_id
           @message = message
           @rule_path = rule_path
+          @oneof_name = oneof_name
         end
 
         def validate(context, message)
           return if context.done?
+
+          # For oneof members, skip validation if not the selected field
+          if @oneof_name
+            selected = message.send(@oneof_name) rescue nil
+            return unless selected&.to_s == @field.name
+          end
 
           value = message.send(@field.name)
           return if should_ignore?(value)
@@ -965,7 +1071,8 @@ module Protovalidate
           case value
           when String then value.empty?
           when Numeric then value.zero?
-          when TrueClass, FalseClass then false
+          when FalseClass then true # false is the default/zero value for booleans
+          when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
           else
@@ -1124,13 +1231,14 @@ module Protovalidate
 
       # Validates bool const.
       class BoolConstRule < DirectFieldRule
-        def initialize(field:, const:, ignore: :IGNORE_UNSPECIFIED)
+        def initialize(field:, const:, ignore: :IGNORE_UNSPECIFIED, oneof_name: nil)
           super(
             field: field,
             ignore: ignore,
             constraint_id: "bool.const",
             message: "value must be #{const}",
-            rule_path: RulePath.build(:bool, :const)
+            rule_path: RulePath.build(:bool, :const),
+            oneof_name: oneof_name
           )
           @const = const
         end
