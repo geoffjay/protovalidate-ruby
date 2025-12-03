@@ -251,9 +251,8 @@ module Protovalidate
 
           # Get the numeric value - symbols are defined, integers may not be
           numeric_value = if value.is_a?(Symbol)
-                            # Symbol means it's a defined value, look up its number
-                            entry = enum_descriptor.lookup_name(value.to_s)
-                            entry&.number || 0
+                            # lookup_name returns the integer value directly
+                            enum_descriptor.lookup_name(value) || 0
                           else
                             value.to_i
                           end
@@ -277,6 +276,150 @@ module Protovalidate
             )
             violation.field_value = value
             context.add(violation)
+          end
+        end
+      end
+
+      # Validates that an enum value equals a constant.
+      class EnumConstRule < Base
+        def initialize(field:, const_value:, ignore: :IGNORE_UNSPECIFIED)
+          super()
+          @field = field
+          @const_value = const_value
+          @ignore = ignore
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if @ignore == :IGNORE_ALWAYS
+
+          numeric_value = enum_to_int(value, @field.subtype)
+          return if @ignore == :IGNORE_IF_UNPOPULATED && numeric_value.zero?
+
+          return if numeric_value == @const_value
+
+          field_elem = FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: :enum
+          )
+
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: "enum.const",
+              message: "value must equal #{@const_value}"
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        end
+
+        private
+
+        def enum_to_int(value, enum_descriptor)
+          if value.is_a?(Symbol)
+            # lookup_name returns the integer value directly
+            enum_descriptor&.lookup_name(value) || 0
+          else
+            value.to_i
+          end
+        end
+      end
+
+      # Validates that an enum value is in a list.
+      class EnumInRule < Base
+        def initialize(field:, in_list:, ignore: :IGNORE_UNSPECIFIED)
+          super()
+          @field = field
+          @in_list = in_list
+          @ignore = ignore
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if @ignore == :IGNORE_ALWAYS
+
+          numeric_value = enum_to_int(value, @field.subtype)
+          return if @ignore == :IGNORE_IF_UNPOPULATED && numeric_value.zero?
+
+          return if @in_list.include?(numeric_value)
+
+          field_elem = FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: :enum
+          )
+
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: "enum.in",
+              message: "value must be in [#{@in_list.join(', ')}]"
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        end
+
+        private
+
+        def enum_to_int(value, enum_descriptor)
+          if value.is_a?(Symbol)
+            # lookup_name returns the integer value directly
+            enum_descriptor&.lookup_name(value) || 0
+          else
+            value.to_i
+          end
+        end
+      end
+
+      # Validates that an enum value is not in a list.
+      class EnumNotInRule < Base
+        def initialize(field:, not_in_list:, ignore: :IGNORE_UNSPECIFIED)
+          super()
+          @field = field
+          @not_in_list = not_in_list
+          @ignore = ignore
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if @ignore == :IGNORE_ALWAYS
+
+          numeric_value = enum_to_int(value, @field.subtype)
+          return if @ignore == :IGNORE_IF_UNPOPULATED && numeric_value.zero?
+
+          return unless @not_in_list.include?(numeric_value)
+
+          field_elem = FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: :enum
+          )
+
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: "enum.not_in",
+              message: "value must not be in [#{@not_in_list.join(', ')}]"
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        end
+
+        private
+
+        def enum_to_int(value, enum_descriptor)
+          if value.is_a?(Symbol)
+            # lookup_name returns the integer value directly
+            enum_descriptor&.lookup_name(value) || 0
+          else
+            value.to_i
           end
         end
       end

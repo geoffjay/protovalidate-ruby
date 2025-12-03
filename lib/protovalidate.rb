@@ -1,5 +1,13 @@
 # frozen_string_literal: true
 
+# Register CEL extension hook BEFORE cel gem loads and freezes classes
+# This ensures protovalidate's custom CEL functions (isHostAndPort, isEmail, etc.)
+# are available when the cel gem initializes
+CEL_EXTENSION_HOOKS ||= []
+CEL_EXTENSION_HOOKS << lambda {
+  require_relative "protovalidate/internal/cel_extensions"
+}
+
 require_relative "protovalidate/version"
 require_relative "protovalidate/error"
 require_relative "protovalidate/violation"

@@ -523,6 +523,15 @@ module Protovalidate
       def compile_enum_rules(field, enum_rules, ignore)
         rules = []
 
+        # const rule
+        if enum_rules.respond_to?(:has_const?) && enum_rules.has_const?
+          rules << Rules::EnumConstRule.new(
+            field: field,
+            const_value: enum_rules.const,
+            ignore: ignore
+          )
+        end
+
         if enum_rules.defined_only
           rules << Rules::EnumDefinedOnlyRule.new(
             field: field,
@@ -531,15 +540,19 @@ module Protovalidate
         end
 
         if enum_rules.in && !enum_rules.in.empty?
-          in_list = enum_rules.in.join(", ")
-          rules << build_cel_rule(field, "int(this) in [#{in_list}]", ignore,
-                                  "enum.in", "value must be in [#{in_list}]")
+          rules << Rules::EnumInRule.new(
+            field: field,
+            in_list: enum_rules.in.to_a,
+            ignore: ignore
+          )
         end
 
         if enum_rules.not_in && !enum_rules.not_in.empty?
-          not_in_list = enum_rules.not_in.join(", ")
-          rules << build_cel_rule(field, "!(int(this) in [#{not_in_list}])", ignore,
-                                  "enum.not_in", "value must not be in [#{not_in_list}]")
+          rules << Rules::EnumNotInRule.new(
+            field: field,
+            not_in_list: enum_rules.not_in.to_a,
+            ignore: ignore
+          )
         end
 
         rules.compact
