@@ -1,0 +1,54 @@
+# .rubocop.yml
+AllCops:
+  TargetRubyVersion: 3.1
+  NewCops: enable
+  Exclude:
+    - 'contrib/**/*'
+    - 'gen/**/*'
+    - 'vendor/**/*'
+    - 'bin/*'
+
+# Style preferences
+Style/Documentation:
+  Enabled: false
+
+Style/FrozenStringLiteralComment:
+  EnforcedStyle: always
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
+
+# Metrics
+Metrics/MethodLength:
+  Max: 30
+  Exclude:
+    - 'test/**/*'
+    - 'spec/**/*'
+
+Metrics/ClassLength:
+  Max: 200
+
+Metrics/BlockLength:
+  Exclude:
+    - 'test/**/*'
+    - 'spec/**/*'
+    - '*.gemspec'
+
+Metrics/AbcSize:
+  Max: 30
+
+# Layout
+Layout/LineLength:
+  Max: 120
+  Exclude:
+    - 'test/**/*'
+    - 'spec/**/*'
+
+# Naming
+Naming/FileName:
+  Exclude:
+    - 'Gemfile'
+    - 'Rakefile'

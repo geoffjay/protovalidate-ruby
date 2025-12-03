@@ -1,0 +1,81 @@
+# Ruby gem artifacts
+*.gem
+*.rbc
+/.config
+/coverage/
+/InstalledFiles
+/pkg/
+/spec/reports/
+/spec/examples.txt
+/test/tmp/
+/test/version_tmp/
+/tmp/
+
+# Documentation
+/.yardoc/
+/_yardoc/
+/doc/
+/rdoc/
+
+# Environment
+.env
+.env.*
+
+# Bundler
+/.bundle/
+/vendor/bundle
+/lib/bundler/man/
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Test artifacts
+.rspec_status
+
+# Generated protobuf files (optional - uncomment if you want to ignore)
+# /gen/
+
+# Byebug/debugger history
+.byebug_history
+
+# IRB/Pry history
+.irb_history
+.pry_history
+
+# Gem build directory
+/build/
+
+# Local configuration
+/.ruby-version
+/.ruby-gemset
+
+# Gemfile.lock (optional - some prefer to commit this for apps, not gems)
+# Gemfile.lock
+
+# Coverage
+/coverage/
+/.simplecov
+
+# Tags
+/tags
+/TAGS
+
+# Compiled assets
+*.o
+*.a
+*.so
+
+# YARD documentation
+/.yard/
