@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "cel"
+require "ostruct"
 require_relative "rules"
 require_relative "cel_helpers"
 require_relative "constraint_resolver"
@@ -25,7 +26,13 @@ module Protovalidate
         full_name = descriptor.name
 
         @cache_mutex.synchronize do
-          return @cache[full_name] if @cache.key?(full_name)
+          if @cache.key?(full_name)
+            cached = @cache[full_name]
+            # Re-raise cached compilation errors
+            raise cached if cached.is_a?(Exception)
+
+            return cached
+          end
 
           begin
             rules = compile_rules(descriptor)
@@ -33,8 +40,9 @@ module Protovalidate
             rules
           rescue StandardError => e
             # Cache compilation errors to avoid retrying
-            @cache[full_name] = e
-            raise CompilationError.new("Failed to compile rules for #{full_name}", cause: e)
+            error = CompilationError.new("Failed to compile rules for #{full_name}", cause: e)
+            @cache[full_name] = error
+            raise error
           end
         end
       end
@@ -143,6 +151,7 @@ module Protovalidate
 
       def compile_type_specific_rules(field, constraint, ignore)
         rules = []
+        is_map = map_field?(field)
 
         case field.type
         when :string
@@ -160,193 +169,312 @@ module Protovalidate
         when :enum
           rules.concat(compile_enum_rules(field, constraint.enum, ignore)) if constraint.enum
         when :message
-          rules.concat(compile_message_field_rules(field, constraint, ignore))
+          rules.concat(compile_message_field_rules(field, constraint, ignore)) unless is_map
         end
 
-        # Handle repeated fields
-        if field.label == :repeated && !field.map? && constraint.repeated
+        # Handle repeated fields (but not maps, which are also repeated)
+        if field.label == :repeated && !is_map && constraint.repeated
           rules.concat(compile_repeated_rules(field, constraint.repeated, ignore))
         end
 
         # Handle map fields
-        rules.concat(compile_map_rules(field, constraint.map, ignore)) if field.map? && constraint.map
+        rules.concat(compile_map_rules(field, constraint.map, ignore)) if is_map && constraint.map
 
         rules
+      end
+
+      # Checks if a field is a map field.
+      # In protobuf, maps are represented as repeated message fields with an entry type
+      # containing "key" and "value" fields.
+      def map_field?(field)
+        return false unless field.type == :message && field.label == :repeated
+        return false unless field.subtype
+
+        # Map entry types have exactly 2 fields: "key" (field number 1) and "value" (field number 2)
+        has_key = false
+        has_value = false
+
+        field.subtype.each do |subfield|
+          has_key = true if subfield.name == "key" && subfield.number == 1
+          has_value = true if subfield.name == "value" && subfield.number == 2
+        end
+
+        has_key && has_value
       end
 
       def compile_string_rules(field, string_rules, ignore)
         rules = []
 
-        # Standard string validations compiled to CEL
-        if string_rules.min_len&.positive?
-          rules << build_cel_rule(field, "size(this) >= #{string_rules.min_len}", ignore,
-                                  "string.min_len", "value length must be at least #{string_rules.min_len} characters")
+        # Const
+        if string_rules.has_const?
+          rules << Rules::StringConstRule.new(field: field, const: string_rules.const, ignore: ignore)
         end
 
-        if string_rules.max_len&.positive?
-          rules << build_cel_rule(field, "size(this) <= #{string_rules.max_len}", ignore,
-                                  "string.max_len", "value length must be at most #{string_rules.max_len} characters")
+        # Length (unicode codepoints)
+        if string_rules.has_len?
+          rules << Rules::StringLenRule.new(field: field, len: string_rules.len, ignore: ignore)
         end
 
-        if string_rules.len&.positive?
-          rules << build_cel_rule(field, "size(this) == #{string_rules.len}", ignore,
-                                  "string.len", "value length must be #{string_rules.len} characters")
+        if string_rules.has_min_len?
+          rules << Rules::StringMinLenRule.new(field: field, min_len: string_rules.min_len, ignore: ignore)
         end
 
+        if string_rules.has_max_len?
+          rules << Rules::StringMaxLenRule.new(field: field, max_len: string_rules.max_len, ignore: ignore)
+        end
+
+        # Byte length
+        if string_rules.has_len_bytes?
+          rules << Rules::StringLenBytesRule.new(field: field, len_bytes: string_rules.len_bytes, ignore: ignore)
+        end
+
+        if string_rules.has_min_bytes?
+          rules << Rules::StringMinBytesRule.new(field: field, min_bytes: string_rules.min_bytes, ignore: ignore)
+        end
+
+        if string_rules.has_max_bytes?
+          rules << Rules::StringMaxBytesRule.new(field: field, max_bytes: string_rules.max_bytes, ignore: ignore)
+        end
+
+        # Pattern
         if string_rules.pattern && !string_rules.pattern.empty?
-          escaped = string_rules.pattern.gsub("\\", "\\\\\\\\").gsub('"', '\\"')
-          rules << build_cel_rule(field, "this.matches(\"#{escaped}\")", ignore,
-                                  "string.pattern", "value must match pattern '#{string_rules.pattern}'")
+          rules << Rules::StringPatternRule.new(field: field, pattern: string_rules.pattern, ignore: ignore)
         end
 
-        # Well-known string formats
-        if string_rules.email
-          rules << build_cel_rule(field, "this.isEmail()", ignore,
-                                  "string.email", "value must be a valid email address")
+        # Prefix/Suffix/Contains
+        if string_rules.prefix && !string_rules.prefix.empty?
+          rules << Rules::StringPrefixRule.new(field: field, prefix: string_rules.prefix, ignore: ignore)
         end
 
-        if string_rules.uri
-          rules << build_cel_rule(field, "this.isUri()", ignore,
-                                  "string.uri", "value must be a valid URI")
+        if string_rules.suffix && !string_rules.suffix.empty?
+          rules << Rules::StringSuffixRule.new(field: field, suffix: string_rules.suffix, ignore: ignore)
         end
 
-        if string_rules.uri_ref
-          rules << build_cel_rule(field, "this.isUriRef()", ignore,
-                                  "string.uri_ref", "value must be a valid URI reference")
+        if string_rules.contains && !string_rules.contains.empty?
+          rules << Rules::StringContainsRule.new(field: field, contains: string_rules.contains, ignore: ignore)
         end
 
-        if string_rules.hostname
-          rules << build_cel_rule(field, "this.isHostname()", ignore,
-                                  "string.hostname", "value must be a valid hostname")
+        if string_rules.not_contains && !string_rules.not_contains.empty?
+          rules << Rules::StringNotContainsRule.new(field: field, not_contains: string_rules.not_contains, ignore: ignore)
         end
 
-        if string_rules.ip
-          rules << build_cel_rule(field, "this.isIp()", ignore,
-                                  "string.ip", "value must be a valid IP address")
+        # In/NotIn lists
+        if string_rules.in && !string_rules.in.empty?
+          rules << Rules::StringInRule.new(field: field, values: string_rules.in.to_a, ignore: ignore)
         end
 
-        if string_rules.ipv4
-          rules << build_cel_rule(field, "this.isIp(4)", ignore,
-                                  "string.ipv4", "value must be a valid IPv4 address")
+        if string_rules.not_in && !string_rules.not_in.empty?
+          rules << Rules::StringNotInRule.new(field: field, values: string_rules.not_in.to_a, ignore: ignore)
         end
 
-        if string_rules.ipv6
-          rules << build_cel_rule(field, "this.isIp(6)", ignore,
-                                  "string.ipv6", "value must be a valid IPv6 address")
-        end
+        # Well-known formats
+        rules << Rules::StringEmailRule.new(field: field, ignore: ignore) if string_rules.email
+        rules << Rules::StringHostnameRule.new(field: field, ignore: ignore) if string_rules.hostname
+        rules << Rules::StringIpRule.new(field: field, version: 0, ignore: ignore) if string_rules.ip
+        rules << Rules::StringIpRule.new(field: field, version: 4, ignore: ignore) if string_rules.ipv4
+        rules << Rules::StringIpRule.new(field: field, version: 6, ignore: ignore) if string_rules.ipv6
+        rules << Rules::StringUriRule.new(field: field, ignore: ignore) if string_rules.uri
+        rules << Rules::StringUriRefRule.new(field: field, ignore: ignore) if string_rules.uri_ref
+        rules << Rules::StringUuidRule.new(field: field, ignore: ignore) if string_rules.uuid
 
-        # UUID validation
-        if string_rules.uuid
-          uuid_pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-          rules << build_cel_rule(field, "this.matches(\"#{uuid_pattern}\")", ignore,
-                                  "string.uuid", "value must be a valid UUID")
-        end
-
-        rules.compact
+        rules
       end
 
       def compile_bytes_rules(field, bytes_rules, ignore)
         rules = []
 
-        if bytes_rules.min_len&.positive?
-          rules << build_cel_rule(field, "size(this) >= #{bytes_rules.min_len}", ignore,
-                                  "bytes.min_len", "value length must be at least #{bytes_rules.min_len} bytes")
+        # Const
+        if bytes_rules.has_const?
+          rules << Rules::BytesConstRule.new(field: field, const: bytes_rules.const, ignore: ignore)
         end
 
-        if bytes_rules.max_len&.positive?
-          rules << build_cel_rule(field, "size(this) <= #{bytes_rules.max_len}", ignore,
-                                  "bytes.max_len", "value length must be at most #{bytes_rules.max_len} bytes")
+        # Length
+        if bytes_rules.has_len?
+          rules << Rules::BytesLenRule.new(field: field, len: bytes_rules.len, ignore: ignore)
         end
 
-        if bytes_rules.len&.positive?
-          rules << build_cel_rule(field, "size(this) == #{bytes_rules.len}", ignore,
-                                  "bytes.len", "value length must be #{bytes_rules.len} bytes")
+        if bytes_rules.has_min_len?
+          rules << Rules::BytesMinLenRule.new(field: field, min_len: bytes_rules.min_len, ignore: ignore)
         end
 
-        rules.compact
+        if bytes_rules.has_max_len?
+          rules << Rules::BytesMaxLenRule.new(field: field, max_len: bytes_rules.max_len, ignore: ignore)
+        end
+
+        # Pattern
+        if bytes_rules.pattern && !bytes_rules.pattern.empty?
+          rules << Rules::BytesPatternRule.new(field: field, pattern: bytes_rules.pattern, ignore: ignore)
+        end
+
+        # Prefix/Suffix/Contains
+        if bytes_rules.prefix && !bytes_rules.prefix.empty?
+          rules << Rules::BytesPrefixRule.new(field: field, prefix: bytes_rules.prefix, ignore: ignore)
+        end
+
+        if bytes_rules.suffix && !bytes_rules.suffix.empty?
+          rules << Rules::BytesSuffixRule.new(field: field, suffix: bytes_rules.suffix, ignore: ignore)
+        end
+
+        if bytes_rules.contains && !bytes_rules.contains.empty?
+          rules << Rules::BytesContainsRule.new(field: field, contains: bytes_rules.contains, ignore: ignore)
+        end
+
+        # In/NotIn lists
+        if bytes_rules.in && !bytes_rules.in.empty?
+          rules << Rules::BytesInRule.new(field: field, values: bytes_rules.in.to_a, ignore: ignore)
+        end
+
+        if bytes_rules.not_in && !bytes_rules.not_in.empty?
+          rules << Rules::BytesNotInRule.new(field: field, values: bytes_rules.not_in.to_a, ignore: ignore)
+        end
+
+        # IP address formats
+        rules << Rules::BytesIpRule.new(field: field, version: 0, ignore: ignore) if bytes_rules.ip
+        rules << Rules::BytesIpRule.new(field: field, version: 4, ignore: ignore) if bytes_rules.ipv4
+        rules << Rules::BytesIpRule.new(field: field, version: 6, ignore: ignore) if bytes_rules.ipv6
+
+        rules
+      end
+
+      # Compiles numeric range rules, handling combined gt/lt/gte/lte bounds.
+      # Returns a combined rule when both lower and upper bounds are set,
+      # or individual rules when only one bound is set.
+      def compile_numeric_range_rules(field, num_rules, ignore, type_name)
+        rules = []
+
+        has_gt = num_rules.has_gt?
+        has_gte = num_rules.has_gte?
+        has_lt = num_rules.has_lt?
+        has_lte = num_rules.has_lte?
+
+        # Determine if we have a combined range
+        lower_strict = has_gt
+        lower_inclusive = has_gte
+        upper_strict = has_lt
+        upper_inclusive = has_lte
+
+        lower = lower_strict ? num_rules.gt : (lower_inclusive ? num_rules.gte : nil)
+        upper = upper_strict ? num_rules.lt : (upper_inclusive ? num_rules.lte : nil)
+
+        if lower && upper
+          # Combined range rule
+          # Inclusive (inside range): lower < upper
+          # Exclusive (outside range): lower > upper
+          exclusive = lower > upper
+
+          if lower_strict && upper_strict
+            if exclusive
+              rules << Rules::NumericGtLtExclusiveRule.new(field: field, gt: lower, lt: upper, type_name: type_name, ignore: ignore)
+            else
+              rules << Rules::NumericGtLtRule.new(field: field, gt: lower, lt: upper, type_name: type_name, ignore: ignore)
+            end
+          elsif lower_strict && upper_inclusive
+            if exclusive
+              rules << Rules::NumericGtLteExclusiveRule.new(field: field, gt: lower, lte: upper, type_name: type_name, ignore: ignore)
+            else
+              rules << Rules::NumericGtLteRule.new(field: field, gt: lower, lte: upper, type_name: type_name, ignore: ignore)
+            end
+          elsif lower_inclusive && upper_strict
+            if exclusive
+              rules << Rules::NumericGteLtExclusiveRule.new(field: field, gte: lower, lt: upper, type_name: type_name, ignore: ignore)
+            else
+              rules << Rules::NumericGteLtRule.new(field: field, gte: lower, lt: upper, type_name: type_name, ignore: ignore)
+            end
+          else # lower_inclusive && upper_inclusive
+            if exclusive
+              rules << Rules::NumericGteLteExclusiveRule.new(field: field, gte: lower, lte: upper, type_name: type_name, ignore: ignore)
+            else
+              rules << Rules::NumericGteLteRule.new(field: field, gte: lower, lte: upper, type_name: type_name, ignore: ignore)
+            end
+          end
+        else
+          # Single bound rules
+          if has_gt
+            rules << Rules::NumericGtRule.new(field: field, bound: num_rules.gt, ignore: ignore, type_name: type_name)
+          end
+
+          if has_gte
+            rules << Rules::NumericGteRule.new(field: field, bound: num_rules.gte, ignore: ignore, type_name: type_name)
+          end
+
+          if has_lt
+            rules << Rules::NumericLtRule.new(field: field, bound: num_rules.lt, ignore: ignore, type_name: type_name)
+          end
+
+          if has_lte
+            rules << Rules::NumericLteRule.new(field: field, bound: num_rules.lte, ignore: ignore, type_name: type_name)
+          end
+        end
+
+        rules
       end
 
       def compile_int_rules(field, constraint, ignore)
         rules = []
         int_rules = case field.type
-                    when :int32, :sint32, :sfixed32 then constraint.int32
-                    when :int64, :sint64, :sfixed64 then constraint.int64
+                    when :int32 then constraint.int32
+                    when :int64 then constraint.int64
+                    when :sint32 then constraint.sint32
+                    when :sint64 then constraint.sint64
+                    when :sfixed32 then constraint.sfixed32
+                    when :sfixed64 then constraint.sfixed64
                     end
         return rules unless int_rules
 
         type_name = field.type.to_s
 
-        if int_rules.gt
-          rules << build_cel_rule(field, "this > #{int_rules.gt}", ignore,
-                                  "#{type_name}.gt", "value must be greater than #{int_rules.gt}")
-        end
+        # Handle combined range rules
+        rules.concat(compile_numeric_range_rules(field, int_rules, ignore, type_name))
 
-        if int_rules.gte
-          rules << build_cel_rule(field, "this >= #{int_rules.gte}", ignore,
-                                  "#{type_name}.gte", "value must be greater than or equal to #{int_rules.gte}")
-        end
-
-        if int_rules.lt
-          rules << build_cel_rule(field, "this < #{int_rules.lt}", ignore,
-                                  "#{type_name}.lt", "value must be less than #{int_rules.lt}")
-        end
-
-        if int_rules.lte
-          rules << build_cel_rule(field, "this <= #{int_rules.lte}", ignore,
-                                  "#{type_name}.lte", "value must be less than or equal to #{int_rules.lte}")
-        end
-
-        if int_rules.const
-          rules << build_cel_rule(field, "this == #{int_rules.const}", ignore,
-                                  "#{type_name}.const", "value must equal #{int_rules.const}")
+        if int_rules.has_const?
+          rules << Rules::NumericConstRule.new(field: field, const: int_rules.const, ignore: ignore,
+                                               type_name: type_name)
         end
 
         if int_rules.in && !int_rules.in.empty?
-          in_list = int_rules.in.join(", ")
-          rules << build_cel_rule(field, "this in [#{in_list}]", ignore,
-                                  "#{type_name}.in", "value must be in [#{in_list}]")
+          rules << Rules::NumericInRule.new(field: field, values: int_rules.in.to_a, ignore: ignore,
+                                            type_name: type_name)
         end
 
         if int_rules.not_in && !int_rules.not_in.empty?
-          not_in_list = int_rules.not_in.join(", ")
-          rules << build_cel_rule(field, "!(this in [#{not_in_list}])", ignore,
-                                  "#{type_name}.not_in", "value must not be in [#{not_in_list}]")
+          rules << Rules::NumericNotInRule.new(field: field, values: int_rules.not_in.to_a, ignore: ignore,
+                                               type_name: type_name)
         end
 
-        rules.compact
+        rules
       end
 
       def compile_uint_rules(field, constraint, ignore)
         rules = []
         uint_rules = case field.type
-                     when :uint32, :fixed32 then constraint.uint32
-                     when :uint64, :fixed64 then constraint.uint64
+                     when :uint32 then constraint.uint32
+                     when :uint64 then constraint.uint64
+                     when :fixed32 then constraint.fixed32
+                     when :fixed64 then constraint.fixed64
                      end
         return rules unless uint_rules
 
         type_name = field.type.to_s
 
-        if uint_rules.gt
-          rules << build_cel_rule(field, "this > uint(#{uint_rules.gt})", ignore,
-                                  "#{type_name}.gt", "value must be greater than #{uint_rules.gt}")
+        # Handle combined range rules
+        rules.concat(compile_numeric_range_rules(field, uint_rules, ignore, type_name))
+
+        if uint_rules.has_const?
+          rules << Rules::NumericConstRule.new(field: field, const: uint_rules.const, ignore: ignore,
+                                               type_name: type_name)
         end
 
-        if uint_rules.gte
-          rules << build_cel_rule(field, "this >= uint(#{uint_rules.gte})", ignore,
-                                  "#{type_name}.gte", "value must be greater than or equal to #{uint_rules.gte}")
+        if uint_rules.in && !uint_rules.in.empty?
+          rules << Rules::NumericInRule.new(field: field, values: uint_rules.in.to_a, ignore: ignore,
+                                            type_name: type_name)
         end
 
-        if uint_rules.lt
-          rules << build_cel_rule(field, "this < uint(#{uint_rules.lt})", ignore,
-                                  "#{type_name}.lt", "value must be less than #{uint_rules.lt}")
+        if uint_rules.not_in && !uint_rules.not_in.empty?
+          rules << Rules::NumericNotInRule.new(field: field, values: uint_rules.not_in.to_a, ignore: ignore,
+                                               type_name: type_name)
         end
 
-        if uint_rules.lte
-          rules << build_cel_rule(field, "this <= uint(#{uint_rules.lte})", ignore,
-                                  "#{type_name}.lte", "value must be less than or equal to #{uint_rules.lte}")
-        end
-
-        rules.compact
+        rules
       end
 
       def compile_float_rules(field, constraint, ignore)
@@ -359,38 +487,37 @@ module Protovalidate
 
         type_name = field.type.to_s
 
-        if float_rules.gt
-          rules << build_cel_rule(field, "this > #{float_rules.gt}", ignore,
-                                  "#{type_name}.gt", "value must be greater than #{float_rules.gt}")
+        # Handle combined range rules
+        rules.concat(compile_numeric_range_rules(field, float_rules, ignore, type_name))
+
+        if float_rules.has_const?
+          rules << Rules::NumericConstRule.new(field: field, const: float_rules.const, ignore: ignore,
+                                               type_name: type_name)
         end
 
-        if float_rules.gte
-          rules << build_cel_rule(field, "this >= #{float_rules.gte}", ignore,
-                                  "#{type_name}.gte", "value must be greater than or equal to #{float_rules.gte}")
+        if float_rules.in && !float_rules.in.empty?
+          rules << Rules::NumericInRule.new(field: field, values: float_rules.in.to_a, ignore: ignore,
+                                            type_name: type_name)
         end
 
-        if float_rules.lt
-          rules << build_cel_rule(field, "this < #{float_rules.lt}", ignore,
-                                  "#{type_name}.lt", "value must be less than #{float_rules.lt}")
+        if float_rules.not_in && !float_rules.not_in.empty?
+          rules << Rules::NumericNotInRule.new(field: field, values: float_rules.not_in.to_a, ignore: ignore,
+                                               type_name: type_name)
         end
 
-        if float_rules.lte
-          rules << build_cel_rule(field, "this <= #{float_rules.lte}", ignore,
-                                  "#{type_name}.lte", "value must be less than or equal to #{float_rules.lte}")
-        end
+        rules << Rules::FloatFiniteRule.new(field: field, ignore: ignore, type_name: type_name) if float_rules.finite
 
-        rules.compact
+        rules
       end
 
       def compile_bool_rules(field, bool_rules, ignore)
         rules = []
 
-        unless bool_rules.const.nil?
-          rules << build_cel_rule(field, "this == #{bool_rules.const}", ignore,
-                                  "bool.const", "value must be #{bool_rules.const}")
+        if bool_rules.has_const?
+          rules << Rules::BoolConstRule.new(field: field, const: bool_rules.const, ignore: ignore)
         end
 
-        rules.compact
+        rules
       end
 
       def compile_enum_rules(field, enum_rules, ignore)

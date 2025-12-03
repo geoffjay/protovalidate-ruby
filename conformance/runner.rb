@@ -22,7 +22,7 @@ require "google/protobuf/any_pb"
 require "google/protobuf/descriptor_pb"
 
 # Load all generated conformance case protos
-Dir[File.expand_path("../gen/buf/validate/conformance/**/*_pb.rb", __dir__)].sort.each do |file|
+Dir[File.expand_path("../gen/buf/validate/conformance/**/*_pb.rb", __dir__)].each do |file|
   require file
 end
 
@@ -158,7 +158,7 @@ module Protovalidate
           Buf::Validate::Violation.new(
             field: field_path_to_proto(v.field_path),
             rule: rule_path_to_proto(v.rule_path),
-            constraint_id: v.constraint_id || "",
+            rule_id: v.constraint_id || "",
             message: v.message || "",
             for_key: v.for_key || false
           )

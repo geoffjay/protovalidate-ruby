@@ -93,13 +93,27 @@ module Protovalidate
         private
 
         def should_ignore?(value)
-          case @ignore
+          # Handle both symbol and integer enum values from protobuf
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
           when :IGNORE_ALWAYS
             true
-          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
             empty_value?(value)
           else
             false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
           end
         end
 
@@ -231,13 +245,23 @@ module Protovalidate
 
           value = message.send(@field.name)
           return if @ignore == :IGNORE_ALWAYS
-          return if @ignore == :IGNORE_IF_UNPOPULATED && value.to_i.zero?
 
           enum_descriptor = @field.subtype
           return unless enum_descriptor
 
+          # Get the numeric value - symbols are defined, integers may not be
+          numeric_value = if value.is_a?(Symbol)
+                            # Symbol means it's a defined value, look up its number
+                            entry = enum_descriptor.lookup_name(value.to_s)
+                            entry&.number || 0
+                          else
+                            value.to_i
+                          end
+
+          return if @ignore == :IGNORE_IF_UNPOPULATED && numeric_value.zero?
+
           # Check if the enum value is defined
-          defined = enum_descriptor.lookup_value(value.to_i)
+          defined = enum_descriptor.lookup_value(numeric_value)
           return if defined
 
           field_elem = FieldPathElement.new(
@@ -375,7 +399,7 @@ module Protovalidate
           return if context.done?
 
           values = message.send(@field.name)
-          return if values.nil? || values.empty?
+          return if values.nil? || values.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
           field_elem = FieldPathElement.new(
@@ -407,7 +431,8 @@ module Protovalidate
 
         def validate_item(context, item)
           # For message items, recursively validate
-          return unless item.respond_to?(:class) && item.class.respond_to?(:descriptor)
+          # Check if item is a protobuf message (not primitive, not RepeatedField/Map)
+          return unless item.is_a?(Google::Protobuf::MessageExts)
 
           descriptor = item.class.descriptor
           rules = @factory.get(descriptor)
@@ -433,7 +458,7 @@ module Protovalidate
           return if context.done?
 
           map_value = message.send(@field.name)
-          return if map_value.nil? || map_value.empty?
+          return if map_value.nil? || map_value.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
           field_elem = FieldPathElement.new(
@@ -443,7 +468,7 @@ module Protovalidate
           )
 
           context.with_field_path_element(field_elem) do
-            map_value.each_key do |key|
+            map_value.each do |key, _value|
               break if context.done?
 
               key_elem = build_key_element(key)
@@ -488,7 +513,7 @@ module Protovalidate
           return if context.done?
 
           map_value = message.send(@field.name)
-          return if map_value.nil? || map_value.empty?
+          return if map_value.nil? || map_value.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
           field_elem = FieldPathElement.new(
@@ -513,7 +538,8 @@ module Protovalidate
 
         def validate_value(context, value)
           # For message values, recursively validate
-          return unless value.respond_to?(:class) && value.class.respond_to?(:descriptor)
+          # Check if value is a protobuf message (not primitive, not RepeatedField/Map)
+          return unless value.is_a?(Google::Protobuf::MessageExts)
 
           descriptor = value.class.descriptor
           rules = @factory.get(descriptor)
@@ -539,6 +565,1066 @@ module Protovalidate
             subscript: key,
             subscript_type: subscript_type
           )
+        end
+      end
+
+      # Base class for direct field validation rules (not using CEL).
+      class DirectFieldRule < Base
+        def initialize(field:, constraint_id:, message:, ignore: :IGNORE_UNSPECIFIED)
+          super()
+          @field = field
+          @ignore = ignore
+          @constraint_id = constraint_id
+          @message = message
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(value)
+
+          return if check_value(value)
+
+          field_elem = build_field_path_element
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: @constraint_id,
+              message: @message
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          raise NotImplementedError, "Subclasses must implement #check_value"
+        end
+
+        private
+
+        def should_ignore?(value)
+          # Handle both symbol and integer enum values from protobuf
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
+          when :IGNORE_ALWAYS
+            true
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
+            empty_value?(value)
+          else
+            false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
+          end
+        end
+
+        def empty_value?(value)
+          return true if value.nil?
+
+          case value
+          when String then value.empty?
+          when Numeric then value.zero?
+          when TrueClass, FalseClass then false
+          when Array then value.empty?
+          when Hash then value.empty?
+          else
+            false
+          end
+        end
+
+        def build_field_path_element
+          FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: @field.type
+          )
+        end
+      end
+
+      # Validates numeric greater than.
+      class NumericGtRule < DirectFieldRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt",
+            message: "value must be greater than #{bound}"
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value > @bound
+        end
+      end
+
+      # Validates numeric greater than or equal.
+      class NumericGteRule < DirectFieldRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte",
+            message: "value must be greater than or equal to #{bound}"
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @bound
+        end
+      end
+
+      # Validates numeric less than.
+      class NumericLtRule < DirectFieldRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.lt",
+            message: "value must be less than #{bound}"
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value < @bound
+        end
+      end
+
+      # Validates numeric less than or equal.
+      class NumericLteRule < DirectFieldRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.lte",
+            message: "value must be less than or equal to #{bound}"
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value <= @bound
+        end
+      end
+
+      # Validates numeric const.
+      class NumericConstRule < DirectFieldRule
+        def initialize(field:, const:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.const",
+            message: "value must equal #{const}"
+          )
+          @const = const
+        end
+
+        protected
+
+        def check_value(value)
+          value == @const
+        end
+      end
+
+      # Validates numeric in list.
+      class NumericInRule < DirectFieldRule
+        def initialize(field:, values:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.in",
+            message: "value must be in [#{values.join(", ")}]"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          @values.include?(value)
+        end
+      end
+
+      # Validates numeric not in list.
+      class NumericNotInRule < DirectFieldRule
+        def initialize(field:, values:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.not_in",
+            message: "value must not be in [#{values.join(", ")}]"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          !@values.include?(value)
+        end
+      end
+
+      # Validates bool const.
+      class BoolConstRule < DirectFieldRule
+        def initialize(field:, const:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bool.const",
+            message: "value must be #{const}"
+          )
+          @const = const
+        end
+
+        protected
+
+        def check_value(value)
+          value == @const
+        end
+      end
+
+      # Validates float/double is finite.
+      class FloatFiniteRule < DirectFieldRule
+        def initialize(field:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.finite",
+            message: "value must be finite"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          !value.nan? && !value.infinite?
+        end
+      end
+
+      # Combined range rules - inclusive (gt < lt means inside range)
+      class NumericGtLtRule < DirectFieldRule
+        def initialize(field:, gt:, lt:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt_lt",
+            message: "value must be greater than #{gt} and less than #{lt}"
+          )
+          @gt = gt
+          @lt = lt
+        end
+
+        protected
+
+        def check_value(value)
+          value > @gt && value < @lt
+        end
+      end
+
+      class NumericGteLteRule < DirectFieldRule
+        def initialize(field:, gte:, lte:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte_lte",
+            message: "value must be greater than or equal to #{gte} and less than or equal to #{lte}"
+          )
+          @gte = gte
+          @lte = lte
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @gte && value <= @lte
+        end
+      end
+
+      class NumericGtLteRule < DirectFieldRule
+        def initialize(field:, gt:, lte:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt_lte",
+            message: "value must be greater than #{gt} and less than or equal to #{lte}"
+          )
+          @gt = gt
+          @lte = lte
+        end
+
+        protected
+
+        def check_value(value)
+          value > @gt && value <= @lte
+        end
+      end
+
+      class NumericGteLtRule < DirectFieldRule
+        def initialize(field:, gte:, lt:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte_lt",
+            message: "value must be greater than or equal to #{gte} and less than #{lt}"
+          )
+          @gte = gte
+          @lt = lt
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @gte && value < @lt
+        end
+      end
+
+      # Combined range rules - exclusive (gt > lt means outside range)
+      class NumericGtLtExclusiveRule < DirectFieldRule
+        def initialize(field:, gt:, lt:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt_lt_exclusive",
+            message: "value must be greater than #{gt} or less than #{lt}"
+          )
+          @gt = gt
+          @lt = lt
+        end
+
+        protected
+
+        def check_value(value)
+          value > @gt || value < @lt
+        end
+      end
+
+      class NumericGteLteExclusiveRule < DirectFieldRule
+        def initialize(field:, gte:, lte:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte_lte_exclusive",
+            message: "value must be greater than or equal to #{gte} or less than or equal to #{lte}"
+          )
+          @gte = gte
+          @lte = lte
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @gte || value <= @lte
+        end
+      end
+
+      class NumericGtLteExclusiveRule < DirectFieldRule
+        def initialize(field:, gt:, lte:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt_lte_exclusive",
+            message: "value must be greater than #{gt} or less than or equal to #{lte}"
+          )
+          @gt = gt
+          @lte = lte
+        end
+
+        protected
+
+        def check_value(value)
+          value > @gt || value <= @lte
+        end
+      end
+
+      class NumericGteLtExclusiveRule < DirectFieldRule
+        def initialize(field:, gte:, lt:, type_name:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte_lt_exclusive",
+            message: "value must be greater than or equal to #{gte} or less than #{lt}"
+          )
+          @gte = gte
+          @lt = lt
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @gte || value < @lt
+        end
+      end
+
+      # String validation rules
+
+      # Validates string const.
+      class StringConstRule < DirectFieldRule
+        def initialize(field:, const:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.const",
+            message: "value must equal \"#{const}\""
+          )
+          @const = const
+        end
+
+        protected
+
+        def check_value(value)
+          value == @const
+        end
+      end
+
+      # Validates string length (in unicode codepoints).
+      class StringLenRule < DirectFieldRule
+        def initialize(field:, len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.len",
+            message: "value length must be #{len} characters"
+          )
+          @len = len
+        end
+
+        protected
+
+        def check_value(value)
+          value.length == @len
+        end
+      end
+
+      # Validates string minimum length.
+      class StringMinLenRule < DirectFieldRule
+        def initialize(field:, min_len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.min_len",
+            message: "value length must be at least #{min_len} characters"
+          )
+          @min_len = min_len
+        end
+
+        protected
+
+        def check_value(value)
+          value.length >= @min_len
+        end
+      end
+
+      # Validates string maximum length.
+      class StringMaxLenRule < DirectFieldRule
+        def initialize(field:, max_len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.max_len",
+            message: "value length must be at most #{max_len} characters"
+          )
+          @max_len = max_len
+        end
+
+        protected
+
+        def check_value(value)
+          value.length <= @max_len
+        end
+      end
+
+      # Validates string byte length.
+      class StringLenBytesRule < DirectFieldRule
+        def initialize(field:, len_bytes:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.len_bytes",
+            message: "value length must be #{len_bytes} bytes"
+          )
+          @len_bytes = len_bytes
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize == @len_bytes
+        end
+      end
+
+      # Validates string minimum byte length.
+      class StringMinBytesRule < DirectFieldRule
+        def initialize(field:, min_bytes:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.min_bytes",
+            message: "value length must be at least #{min_bytes} bytes"
+          )
+          @min_bytes = min_bytes
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize >= @min_bytes
+        end
+      end
+
+      # Validates string maximum byte length.
+      class StringMaxBytesRule < DirectFieldRule
+        def initialize(field:, max_bytes:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.max_bytes",
+            message: "value length must be at most #{max_bytes} bytes"
+          )
+          @max_bytes = max_bytes
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize <= @max_bytes
+        end
+      end
+
+      # Validates string matches pattern.
+      class StringPatternRule < DirectFieldRule
+        def initialize(field:, pattern:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.pattern",
+            message: "value must match pattern '#{pattern}'"
+          )
+          @pattern = Regexp.new(pattern)
+        end
+
+        protected
+
+        def check_value(value)
+          @pattern.match?(value)
+        end
+      end
+
+      # Validates string prefix.
+      class StringPrefixRule < DirectFieldRule
+        def initialize(field:, prefix:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.prefix",
+            message: "value must have prefix \"#{prefix}\""
+          )
+          @prefix = prefix
+        end
+
+        protected
+
+        def check_value(value)
+          value.start_with?(@prefix)
+        end
+      end
+
+      # Validates string suffix.
+      class StringSuffixRule < DirectFieldRule
+        def initialize(field:, suffix:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.suffix",
+            message: "value must have suffix \"#{suffix}\""
+          )
+          @suffix = suffix
+        end
+
+        protected
+
+        def check_value(value)
+          value.end_with?(@suffix)
+        end
+      end
+
+      # Validates string contains.
+      class StringContainsRule < DirectFieldRule
+        def initialize(field:, contains:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.contains",
+            message: "value must contain \"#{contains}\""
+          )
+          @contains = contains
+        end
+
+        protected
+
+        def check_value(value)
+          value.include?(@contains)
+        end
+      end
+
+      # Validates string not contains.
+      class StringNotContainsRule < DirectFieldRule
+        def initialize(field:, not_contains:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.not_contains",
+            message: "value must not contain \"#{not_contains}\""
+          )
+          @not_contains = not_contains
+        end
+
+        protected
+
+        def check_value(value)
+          !value.include?(@not_contains)
+        end
+      end
+
+      # Validates string in list.
+      class StringInRule < DirectFieldRule
+        def initialize(field:, values:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.in",
+            message: "value must be in [#{values.map { |v| "\"#{v}\"" }.join(", ")}]"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          @values.include?(value)
+        end
+      end
+
+      # Validates string not in list.
+      class StringNotInRule < DirectFieldRule
+        def initialize(field:, values:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.not_in",
+            message: "value must not be in [#{values.map { |v| "\"#{v}\"" }.join(", ")}]"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          !@values.include?(value)
+        end
+      end
+
+      # Validates string is valid email.
+      class StringEmailRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.email",
+            message: "value must be a valid email address"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+
+          # Email validation pattern
+          pattern = %r{\A[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z}
+          value.match?(pattern)
+        end
+      end
+
+      # Validates string is valid hostname.
+      class StringHostnameRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.hostname",
+            message: "value must be a valid hostname"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+          return false if value.length > 253
+
+          # Hostname pattern - each label 1-63 chars, alphanumeric and hyphens
+          pattern = /\A(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*\.?\z/
+          value.match?(pattern)
+        end
+      end
+
+      # Validates string is valid IP address.
+      class StringIpRule < DirectFieldRule
+        def initialize(field:, version: 0, ignore: :IGNORE_UNSPECIFIED)
+          constraint_id = case version
+                          when 4 then "string.ipv4"
+                          when 6 then "string.ipv6"
+                          else "string.ip"
+                          end
+          message = case version
+                    when 4 then "value must be a valid IPv4 address"
+                    when 6 then "value must be a valid IPv6 address"
+                    else "value must be a valid IP address"
+                    end
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: constraint_id,
+            message: message
+          )
+          @version = version
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+
+          require "ipaddr"
+          begin
+            addr = IPAddr.new(value)
+            case @version
+            when 4 then addr.ipv4?
+            when 6 then addr.ipv6?
+            else true
+            end
+          rescue IPAddr::InvalidAddressError
+            false
+          end
+        end
+      end
+
+      # Validates string is valid URI.
+      class StringUriRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.uri",
+            message: "value must be a valid URI"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+
+          require "uri"
+          begin
+            uri = URI.parse(value)
+            uri.scheme && !uri.scheme.empty?
+          rescue URI::InvalidURIError
+            false
+          end
+        end
+      end
+
+      # Validates string is valid URI reference.
+      class StringUriRefRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.uri_ref",
+            message: "value must be a valid URI reference"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          return true if value.empty?
+
+          require "uri"
+          begin
+            URI.parse(value)
+            true
+          rescue URI::InvalidURIError
+            false
+          end
+        end
+      end
+
+      # Validates string is valid UUID.
+      class StringUuidRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.uuid",
+            message: "value must be a valid UUID"
+          )
+        end
+
+        protected
+
+        def check_value(value)
+          pattern = /\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
+          value.match?(pattern)
+        end
+      end
+
+      # Validates bytes length.
+      class BytesLenRule < DirectFieldRule
+        def initialize(field:, len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.len",
+            message: "value length must be #{len} bytes"
+          )
+          @len = len
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize == @len
+        end
+      end
+
+      # Validates bytes minimum length.
+      class BytesMinLenRule < DirectFieldRule
+        def initialize(field:, min_len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.min_len",
+            message: "value length must be at least #{min_len} bytes"
+          )
+          @min_len = min_len
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize >= @min_len
+        end
+      end
+
+      # Validates bytes maximum length.
+      class BytesMaxLenRule < DirectFieldRule
+        def initialize(field:, max_len:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.max_len",
+            message: "value length must be at most #{max_len} bytes"
+          )
+          @max_len = max_len
+        end
+
+        protected
+
+        def check_value(value)
+          value.bytesize <= @max_len
+        end
+      end
+
+      # Validates bytes const.
+      class BytesConstRule < DirectFieldRule
+        def initialize(field:, const:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.const",
+            message: "value must equal the specified bytes"
+          )
+          @const = const
+        end
+
+        protected
+
+        def check_value(value)
+          value == @const
+        end
+      end
+
+      # Validates bytes matches pattern.
+      class BytesPatternRule < DirectFieldRule
+        def initialize(field:, pattern:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.pattern",
+            message: "value must match pattern '#{pattern}'"
+          )
+          @pattern = Regexp.new(pattern)
+        end
+
+        protected
+
+        def check_value(value)
+          @pattern.match?(value)
+        end
+      end
+
+      # Validates bytes prefix.
+      class BytesPrefixRule < DirectFieldRule
+        def initialize(field:, prefix:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.prefix",
+            message: "value must have the specified prefix"
+          )
+          @prefix = prefix
+        end
+
+        protected
+
+        def check_value(value)
+          value.start_with?(@prefix)
+        end
+      end
+
+      # Validates bytes suffix.
+      class BytesSuffixRule < DirectFieldRule
+        def initialize(field:, suffix:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.suffix",
+            message: "value must have the specified suffix"
+          )
+          @suffix = suffix
+        end
+
+        protected
+
+        def check_value(value)
+          value.end_with?(@suffix)
+        end
+      end
+
+      # Validates bytes contains.
+      class BytesContainsRule < DirectFieldRule
+        def initialize(field:, contains:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.contains",
+            message: "value must contain the specified bytes"
+          )
+          @contains = contains
+        end
+
+        protected
+
+        def check_value(value)
+          value.include?(@contains)
+        end
+      end
+
+      # Validates bytes in list.
+      class BytesInRule < DirectFieldRule
+        def initialize(field:, values:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.in",
+            message: "value must be in the specified list"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          @values.include?(value)
+        end
+      end
+
+      # Validates bytes not in list.
+      class BytesNotInRule < DirectFieldRule
+        def initialize(field:, values:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "bytes.not_in",
+            message: "value must not be in the specified list"
+          )
+          @values = values.to_set
+        end
+
+        protected
+
+        def check_value(value)
+          !@values.include?(value)
+        end
+      end
+
+      # Validates bytes is valid IP address.
+      class BytesIpRule < DirectFieldRule
+        def initialize(field:, version: 0, ignore: :IGNORE_UNSPECIFIED)
+          constraint_id = case version
+                          when 4 then "bytes.ipv4"
+                          when 6 then "bytes.ipv6"
+                          else "bytes.ip"
+                          end
+          message = case version
+                    when 4 then "value must be a valid IPv4 address"
+                    when 6 then "value must be a valid IPv6 address"
+                    else "value must be a valid IP address"
+                    end
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: constraint_id,
+            message: message
+          )
+          @version = version
+        end
+
+        protected
+
+        def check_value(value)
+          case @version
+          when 4
+            value.bytesize == 4
+          when 6
+            value.bytesize == 16
+          else
+            value.bytesize == 4 || value.bytesize == 16
+          end
         end
       end
     end

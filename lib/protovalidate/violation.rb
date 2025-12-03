@@ -4,10 +4,10 @@ module Protovalidate
   # Represents a single validation violation.
   class Violation
     # @return [FieldPath, nil] Path to the field that caused the violation
-    attr_reader :field_path
+    attr_accessor :field_path
 
     # @return [Array<FieldPathElement>] Path elements to the rule that was violated
-    attr_reader :rule_path
+    attr_accessor :rule_path
 
     # @return [String] The constraint ID (e.g., "string.email")
     attr_reader :constraint_id
@@ -49,7 +49,7 @@ module Protovalidate
       Buf::Validate::Violation.new(
         field: field_path&.to_proto,
         rule: rule_path_to_proto,
-        constraint_id: constraint_id,
+        rule_id: constraint_id,
         message: message,
         for_key: for_key
       )

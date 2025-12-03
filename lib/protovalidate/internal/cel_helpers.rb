@@ -78,14 +78,15 @@ module Protovalidate
 
           case field&.type
           when :message
-            if value.respond_to?(:class) && value.class.respond_to?(:descriptor)
+            if value.is_a?(Google::Protobuf::MessageExts)
               message_to_cel(value)
             else
               value
             end
           when :enum
             # Enums are represented as integers in CEL
-            value.to_i
+            # Handle both symbol (named) and integer (numeric) enum values
+            value.is_a?(Symbol) ? 0 : value.to_i
           else
             value
           end
