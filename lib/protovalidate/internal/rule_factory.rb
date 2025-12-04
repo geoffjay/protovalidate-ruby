@@ -1025,6 +1025,17 @@ module Protovalidate
           rules.concat(compile_bool_item_rules(field, item_constraints.bool, item_ignore)) if item_constraints.bool
         when :enum
           rules.concat(compile_enum_item_rules(field, item_constraints.enum, item_ignore)) if item_constraints.enum
+        when :message
+          # Handle wrapper types in repeated fields
+          if field.subtype
+            wrapper_info = WRAPPER_TYPE_INFO[field.subtype.name]
+            if wrapper_info
+              type_rules = item_constraints.send(wrapper_info[:constraint_field])
+              if type_rules
+                rules.concat(compile_wrapper_item_predefined_rules(field, type_rules, wrapper_info[:rules_class], item_ignore))
+              end
+            end
+          end
         end
 
         # Handle CEL rules on items
@@ -1135,6 +1146,65 @@ module Protovalidate
       def compile_enum_item_rules(_field, _enum_rules, _ignore)
         # TODO: Implement enum item rules
         []
+      end
+
+      # Compiles predefined rules for items in a repeated wrapper field
+      #
+      # @param field [Google::Protobuf::FieldDescriptor] The repeated wrapper field descriptor
+      # @param type_rules [Google::Protobuf::MessageExts] The type-specific rules (StringRules, BoolRules, etc.)
+      # @param rules_class [Class] The class of the type-specific rules
+      # @param ignore [Symbol] The ignore condition
+      # @return [Array<Rules::Base>] The compiled item rules
+      def compile_wrapper_item_predefined_rules(field, type_rules, rules_class, ignore)
+        return [] if type_rules.nil? || rules_class.nil?
+
+        predefined = PredefinedRulesResolver.extract_predefined_rules(type_rules, rules_class)
+        return [] if predefined.empty?
+
+        type_rules_info = TYPE_RULES_FIELD_INFO[rules_class.name] || { field_number: 0, field_name: "" }
+
+        predefined.map do |rule_info|
+          build_wrapper_item_predefined_cel_rule(
+            field,
+            rule_info[:expression],
+            ignore,
+            rule_info[:id],
+            rule_info[:message],
+            rule_info[:field_number],
+            rule_info[:extension_name],
+            type_rules_info,
+            rule_info[:extension_value],
+            rule_info[:extension_type],
+            rule_info[:extension_label]
+          )
+        end.compact
+      end
+
+      # Builds a CEL rule for a predefined rule on a wrapper item in a repeated field
+      def build_wrapper_item_predefined_cel_rule(field, expression, ignore, constraint_id, message, field_number, extension_name, type_rules_info, extension_value = nil, extension_type = nil, extension_label = nil)
+        program = compile_cel_expression(expression, field, :field)
+        rule = OpenStruct.new(
+          id: constraint_id,
+          message: message,
+          expression: expression
+        )
+
+        Rules::WrapperItemPredefinedCelRule.new(
+          field: field,
+          program: program,
+          rule: rule,
+          cel_env: @cel_env,
+          ignore: ignore,
+          field_number: field_number,
+          extension_name: extension_name,
+          type_rules_field_number: type_rules_info[:field_number],
+          type_rules_field_name: type_rules_info[:field_name],
+          extension_value: extension_value,
+          extension_type: extension_type,
+          extension_label: extension_label
+        )
+      rescue StandardError => e
+        raise CompilationError.new("Failed to compile wrapper item predefined CEL expression '#{expression}': #{e.message}", cause: e)
       end
 
       # Compiles predefined rules for wrapper types (StringValue, Int32Value, etc.)

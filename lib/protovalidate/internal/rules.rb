@@ -878,6 +878,210 @@ module Protovalidate
         end
       end
 
+      # Validates items in a repeated wrapper field against predefined CEL rules.
+      # Unlike WrapperPredefinedCelRule which validates the message, this validates individual items
+      # via validate_item (called by RepeatedItemsRule).
+      class WrapperItemPredefinedCelRule < Base
+        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, field_number: 1161,
+                       extension_name: nil, type_rules_field_number: 0, type_rules_field_name: "",
+                       extension_value: nil, extension_type: nil, extension_label: nil)
+          super()
+          @field = field
+          @program = program
+          @rule = rule
+          @cel_env = cel_env
+          @ignore = ignore
+          @field_number = field_number
+          @extension_name = extension_name
+          @type_rules_field_number = type_rules_field_number
+          @type_rules_field_name = type_rules_field_name
+          @extension_value = extension_value
+          @extension_type = extension_type
+          @extension_label = extension_label
+          @decoded_rule_value = decode_extension_value(extension_value, extension_type, extension_label)
+        end
+
+        # Called by RepeatedItemsRule for each item in the repeated field
+        def validate_item(context, wrapper)
+          return if context.done?
+
+          # Skip nil wrappers
+          return if wrapper.nil?
+          return if @ignore == :IGNORE_ALWAYS
+
+          # Unwrap the value
+          value = wrapper.respond_to?(:value) ? wrapper.value : wrapper
+
+          # Create activation with unwrapped value
+          activation = { this: CelHelpers.ruby_to_cel(value), now: Time.now }
+          activation[:rule] = CelHelpers.ruby_to_cel(@decoded_rule_value) if @decoded_rule_value
+          result = @program.evaluate(activation)
+
+          result_value = result.respond_to?(:value) ? result.value : result
+
+          if result_value.is_a?(String) && !result_value.empty?
+            violation = Violation.new(
+              constraint_id: @rule.id || "",
+              message: result_value,
+              rule_path: build_predefined_rule_path
+            )
+            violation.field_value = value
+            context.add(violation)
+          elsif result_value == false
+            violation = Violation.new(
+              constraint_id: @rule.id || "",
+              message: @rule.message.to_s.empty? ? "predefined rule failed" : @rule.message,
+              rule_path: build_predefined_rule_path
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        rescue Cel::EvaluateError => e
+          raise RuntimeError.new("Wrapper item predefined CEL evaluation failed: #{e.message}", cause: e)
+        end
+
+        private
+
+        def build_predefined_rule_path
+          extension_field_name = @extension_name ? "[#{@extension_name}]" : ""
+
+          # For repeated wrapper items, the rule path is:
+          # repeated.items.{type_rules_field_name}.[extension_name]
+          [
+            FieldPathElement.new(
+              field_number: @field_number,
+              field_name: extension_field_name,
+              field_type: @extension_type || :bool
+            ),
+            FieldPathElement.new(
+              field_number: @type_rules_field_number,
+              field_name: @type_rules_field_name,
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: 4, # items field number in RepeatedRules
+              field_name: "items",
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: 18, # repeated field number in FieldConstraints
+              field_name: "repeated",
+              field_type: :message
+            )
+          ]
+        end
+
+        def decode_extension_value(value, ext_type, ext_label = nil)
+          return nil if value.nil?
+
+          # Handle repeated fields (packed encoding)
+          if ext_label == :repeated
+            return decode_packed_values(value, ext_type)
+          end
+
+          case ext_type
+          when :float
+            value.unpack1("e")
+          when :double
+            value.unpack1("E")
+          when :int32, :sint32, :sfixed32
+            value.is_a?(Integer) ? value : value.unpack1("l<")
+          when :int64, :sint64, :sfixed64
+            value.is_a?(Integer) ? value : value.unpack1("q<")
+          when :uint32, :fixed32
+            value.is_a?(Integer) ? value : value.unpack1("L<")
+          when :uint64, :fixed64
+            value.is_a?(Integer) ? value : value.unpack1("Q<")
+          when :bool
+            value.is_a?(Integer) ? value != 0 : value.unpack1("C") != 0
+          when :string, :bytes
+            value.is_a?(String) ? value : value.to_s
+          else
+            value
+          end
+        end
+
+        # Decodes packed repeated values from binary data
+        def decode_packed_values(data, element_type)
+          return [] if data.nil? || data.empty?
+
+          results = []
+          data = data.b
+          pos = 0
+
+          case element_type
+          when :int32, :int64, :uint32, :uint64, :sint32, :sint64, :enum
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              case element_type
+              when :sint32
+                value = (value >> 1) ^ -(value & 1)
+              when :sint64
+                value = (value >> 1) ^ -(value & 1)
+              when :int32
+                value = value > 0x7FFFFFFF ? value - 0x100000000 : value
+              end
+
+              results << value
+            end
+          when :fixed32, :sfixed32, :float
+            while pos + 4 <= data.bytesize
+              if element_type == :float
+                results << data[pos, 4].unpack1("e")
+              elsif element_type == :sfixed32
+                results << data[pos, 4].unpack1("l<")
+              else
+                results << data[pos, 4].unpack1("L<")
+              end
+              pos += 4
+            end
+          when :fixed64, :sfixed64, :double
+            while pos + 8 <= data.bytesize
+              if element_type == :double
+                results << data[pos, 8].unpack1("E")
+              elsif element_type == :sfixed64
+                results << data[pos, 8].unpack1("q<")
+              else
+                results << data[pos, 8].unpack1("Q<")
+              end
+              pos += 8
+            end
+          when :bool
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              results << (value != 0)
+            end
+          else
+            return data
+          end
+
+          results
+        end
+
+        def decode_varint(data, pos)
+          result = 0
+          shift = 0
+
+          loop do
+            return [nil, nil] if pos >= data.bytesize
+
+            byte = data.getbyte(pos)
+            pos += 1
+
+            result |= (byte & 0x7f) << shift
+
+            return [result, pos] if byte.nobits?(0x80)
+
+            shift += 7
+            return [nil, nil] if shift > 63
+          end
+        end
+      end
+
       # Validates that a required field is present.
       class RequiredRule < Base
         def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
@@ -1394,8 +1598,14 @@ module Protovalidate
         private
 
         def validate_item(context, item)
-          # For message items, recursively validate using the factory
-          if item.is_a?(Google::Protobuf::MessageExts)
+          # Always apply pre-compiled item rules first (for scalars and wrappers)
+          @item_rules.each do |rule|
+            rule.validate_item(context, item)
+            break if context.done?
+          end
+
+          # For message items that aren't wrappers, recursively validate using the factory
+          if item.is_a?(Google::Protobuf::MessageExts) && !wrapper_type?(item)
             descriptor = item.class.descriptor
             rules = @factory.get(descriptor)
 
@@ -1403,13 +1613,24 @@ module Protovalidate
               rule.validate(context, item)
               break if context.done?
             end
-          else
-            # For scalar items, use the pre-compiled item rules
-            @item_rules.each do |rule|
-              rule.validate_item(context, item)
-              break if context.done?
-            end
           end
+        end
+
+        def wrapper_type?(item)
+          return false unless item.is_a?(Google::Protobuf::MessageExts)
+
+          wrapper_names = %w[
+            google.protobuf.StringValue
+            google.protobuf.BytesValue
+            google.protobuf.BoolValue
+            google.protobuf.Int32Value
+            google.protobuf.Int64Value
+            google.protobuf.UInt32Value
+            google.protobuf.UInt64Value
+            google.protobuf.FloatValue
+            google.protobuf.DoubleValue
+          ]
+          wrapper_names.include?(item.class.descriptor.name)
         end
       end
 
