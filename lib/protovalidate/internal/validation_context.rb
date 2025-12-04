@@ -88,13 +88,13 @@ module Protovalidate
         @rule_path_elements.pop
       end
 
-      # Finalizes violation paths by reversing the breadcrumb trail.
+      # Finalizes violation paths by reversing the rule path.
+      # Field paths are already in correct order (parent -> child) after being built via with_field_path_element.
+      # Rule paths are built in reverse order (leaf -> root) and need to be reversed to root -> leaf.
       # Uses non-mutating reverse to avoid affecting cached rule paths.
       def finalize_violations
         @violations.each do |violation|
-          if violation.field_path&.elements
-            violation.field_path = FieldPath.new(violation.field_path.elements.reverse)
-          end
+          # Field paths are already in correct order, don't reverse them
           violation.rule_path = violation.rule_path.reverse
         end
       end

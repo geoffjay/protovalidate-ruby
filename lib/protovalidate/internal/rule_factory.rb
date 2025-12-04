@@ -748,15 +748,17 @@ module Protovalidate
       end
 
       def compile_duration_rules(_field, _duration_rules, _ignore)
+        # Duration validation rules have complex semantics with exclusive ranges
+        # (e.g., gte > lte means value must be >= gte OR <= lte)
+        # This requires careful handling that's not yet implemented
         []
-        # Duration validation rules would be compiled here
-        # For now, return empty - to be implemented
       end
 
       def compile_timestamp_rules(_field, _timestamp_rules, _ignore)
+        # Timestamp validation rules have complex semantics with exclusive ranges
+        # and dynamic time comparisons (lt_now, gt_now, within)
+        # This requires careful handling that's not yet implemented
         []
-        # Timestamp validation rules would be compiled here
-        # For now, return empty - to be implemented
       end
 
       def compile_repeated_rules(field, repeated_rules, ignore)

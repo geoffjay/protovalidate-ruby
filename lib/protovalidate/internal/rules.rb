@@ -219,10 +219,26 @@ module Protovalidate
           activation = CelHelpers.message_to_activation(message)
           result = @program.evaluate(activation)
 
-          unless result == true || (result.respond_to?(:value) && result.value == true)
+          # CEL expressions can return:
+          # - true or empty string: validation passes
+          # - false: validation fails with constraint's message
+          # - non-empty string: validation fails with that string as error message
+          result_value = result.respond_to?(:value) ? result.value : result
+
+          if result_value.is_a?(String)
+            # Non-empty string is an error message
+            unless result_value.empty?
+              violation = Violation.new(
+                constraint_id: @rule.id || "",
+                message: result_value
+              )
+              context.add(violation)
+            end
+          elsif result_value != true
+            # false or any other non-true value fails with constraint message
             violation = Violation.new(
               constraint_id: @rule.id || "",
-              message: @rule.message || "CEL expression evaluated to false"
+              message: @rule.message.to_s.empty? ? "CEL expression evaluated to false" : @rule.message
             )
             context.add(violation)
           end
@@ -267,10 +283,28 @@ module Protovalidate
             activation = CelHelpers.field_to_activation(value, @field)
             result = @program.evaluate(activation)
 
-            unless result == true || (result.respond_to?(:value) && result.value == true)
+            # CEL expressions can return:
+            # - true or empty string: validation passes
+            # - false: validation fails with constraint's message
+            # - non-empty string: validation fails with that string as error message
+            result_value = result.respond_to?(:value) ? result.value : result
+
+            if result_value.is_a?(String)
+              # Non-empty string is an error message
+              unless result_value.empty?
+                violation = Violation.new(
+                  constraint_id: @rule.id || "",
+                  message: result_value,
+                  rule_path: build_cel_rule_path
+                )
+                violation.field_value = value
+                context.add(violation)
+              end
+            elsif result_value != true
+              # false or any other non-true value fails with constraint message
               violation = Violation.new(
                 constraint_id: @rule.id || "",
-                message: @rule.message || "CEL expression evaluated to false",
+                message: @rule.message.to_s.empty? ? "CEL expression evaluated to false" : @rule.message,
                 rule_path: build_cel_rule_path
               )
               violation.field_value = value
@@ -1084,6 +1118,9 @@ module Protovalidate
 
       # Validates that a required field is present.
       class RequiredRule < Base
+        # Field number for 'required' in FieldConstraints
+        REQUIRED_FIELD_NUMBER = 25
+
         def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
           super()
           @field = field
@@ -1108,13 +1145,24 @@ module Protovalidate
           context.with_field_path_element(field_elem) do
             violation = Violation.new(
               constraint_id: "required",
-              message: "value is required"
+              message: "value is required",
+              rule_path: build_rule_path
             )
             context.add(violation)
           end
         end
 
         private
+
+        def build_rule_path
+          [
+            FieldPathElement.new(
+              field_number: REQUIRED_FIELD_NUMBER,
+              field_name: "required",
+              field_type: :bool
+            )
+          ]
+        end
 
         def field_present?(message, value)
           # Check if the field has presence tracking
@@ -1135,6 +1183,8 @@ module Protovalidate
           when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
+          when Google::Protobuf::RepeatedField then value.empty?
+          when Google::Protobuf::Map then value.size.zero?
           else
             false
           end
