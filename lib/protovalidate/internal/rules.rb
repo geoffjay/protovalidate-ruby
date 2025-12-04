@@ -173,15 +173,8 @@ module Protovalidate
           end
 
           def numeric_type_for(type_name)
-            case type_name
-            when :float then :float
-            when :double then :double
-            when :int32, :sint32, :sfixed32 then :int32
-            when :int64, :sint64, :sfixed64 then :int64
-            when :uint32, :fixed32 then :uint32
-            when :uint64, :fixed64 then :uint64
-            else :int64
-            end
+            # Return the actual field type, not the wire type
+            type_name
           end
         end
       end
@@ -256,7 +249,7 @@ module Protovalidate
           value = message.send(@field.name)
 
           # Handle ignore conditions
-          return if should_ignore?(value)
+          return if should_ignore?(message, value)
 
           field_elem = build_field_path_element
 
@@ -279,7 +272,7 @@ module Protovalidate
 
         private
 
-        def should_ignore?(value)
+        def should_ignore?(message, value)
           # Handle both symbol and integer enum values from protobuf
           ignore_value = normalize_ignore(@ignore)
 
@@ -287,7 +280,21 @@ module Protovalidate
           when :IGNORE_ALWAYS
             true
           when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
-            empty_value?(value)
+            # For fields with explicit presence (proto2 optional, proto3 optional, editions explicit),
+            # only ignore if the field is not set. For implicit presence, ignore if zero-value.
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              empty_value?(value)
+            end
+          when :IGNORE_UNSPECIFIED
+            # For IGNORE_UNSPECIFIED, fields with explicit presence should be ignored if not set.
+            # For fields with implicit presence, don't ignore (validate even zero values).
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              false
+            end
           else
             false
           end
@@ -314,9 +321,11 @@ module Protovalidate
           when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
+          when Google::Protobuf::RepeatedField then value.empty?
+          when Google::Protobuf::Map then value.size.zero?
           else
             # For proto messages, check if it's the default
-            if value.respond_to?(:to_h)
+            if value.is_a?(Google::Protobuf::MessageExts) && value.respond_to?(:to_h)
               value.to_h.empty?
             else
               false
@@ -813,12 +822,13 @@ module Protovalidate
 
       # Validates items in a repeated field.
       class RepeatedItemsRule < Base
-        def initialize(field:, item_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED)
+        def initialize(field:, item_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED, item_rules: [])
           super()
           @field = field
           @item_constraints = item_constraints
           @factory = factory
           @ignore = ignore
+          @item_rules = item_rules
         end
 
         def validate(context, message)
@@ -828,27 +838,19 @@ module Protovalidate
           return if values.nil? || values.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
-          field_elem = FieldPathElement.new(
-            field_number: @field.number,
-            field_name: @field.name,
-            field_type: @field.type
-          )
+          values.each_with_index do |item, index|
+            break if context.done?
 
-          context.with_field_path_element(field_elem) do
-            values.each_with_index do |item, index|
-              break if context.done?
+            index_elem = FieldPathElement.new(
+              field_number: @field.number,
+              field_name: @field.name,
+              field_type: @field.type,
+              subscript: index,
+              subscript_type: :index
+            )
 
-              index_elem = FieldPathElement.new(
-                field_number: @field.number,
-                field_name: @field.name,
-                field_type: @field.type,
-                subscript: index,
-                subscript_type: :index
-              )
-
-              context.with_field_path_element(index_elem) do
-                validate_item(context, item)
-              end
+            context.with_field_path_element(index_elem) do
+              validate_item(context, item)
             end
           end
         end
@@ -856,28 +858,36 @@ module Protovalidate
         private
 
         def validate_item(context, item)
-          # For message items, recursively validate
-          # Check if item is a protobuf message (not primitive, not RepeatedField/Map)
-          return unless item.is_a?(Google::Protobuf::MessageExts)
+          # For message items, recursively validate using the factory
+          if item.is_a?(Google::Protobuf::MessageExts)
+            descriptor = item.class.descriptor
+            rules = @factory.get(descriptor)
 
-          descriptor = item.class.descriptor
-          rules = @factory.get(descriptor)
-
-          rules.each do |rule|
-            rule.validate(context, item)
-            break if context.done?
+            rules.each do |rule|
+              rule.validate(context, item)
+              break if context.done?
+            end
+          else
+            # For scalar items, use the pre-compiled item rules
+            @item_rules.each do |rule|
+              rule.validate_item(context, item)
+              break if context.done?
+            end
           end
         end
       end
 
       # Validates keys in a map field.
       class MapKeysRule < Base
-        def initialize(field:, key_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED)
+        def initialize(field:, key_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED, key_rules: [], key_type: nil, value_type: nil)
           super()
           @field = field
           @key_constraints = key_constraints
           @factory = factory
           @ignore = ignore
+          @key_rules = key_rules
+          @key_type = key_type
+          @value_type = value_type
         end
 
         def validate(context, message)
@@ -887,19 +897,15 @@ module Protovalidate
           return if map_value.nil? || map_value.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
-          field_elem = FieldPathElement.new(
-            field_number: @field.number,
-            field_name: @field.name,
-            field_type: :message
-          )
+          map_value.each do |key, _value|
+            break if context.done?
 
-          context.with_field_path_element(field_elem) do
-            map_value.each do |key, _value|
-              break if context.done?
-
-              key_elem = build_key_element(key)
-              context.with_field_path_element(key_elem) do
-                # Key validation would be applied here
+            key_elem = build_key_element(key)
+            context.with_field_path_element(key_elem) do
+              # Apply key validation rules
+              @key_rules.each do |rule|
+                rule.validate_item(context, key)
+                break if context.done?
               end
             end
           end
@@ -920,19 +926,24 @@ module Protovalidate
             field_name: @field.name,
             field_type: :message,
             subscript: key,
-            subscript_type: subscript_type
+            subscript_type: subscript_type,
+            key_type: @key_type,
+            value_type: @value_type
           )
         end
       end
 
       # Validates values in a map field.
       class MapValuesRule < Base
-        def initialize(field:, value_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED)
+        def initialize(field:, value_constraints:, factory:, ignore: :IGNORE_UNSPECIFIED, value_rules: [], key_type: nil, value_type: nil)
           super()
           @field = field
           @value_constraints = value_constraints
           @factory = factory
           @ignore = ignore
+          @value_rules = value_rules
+          @key_type = key_type
+          @value_type = value_type
         end
 
         def validate(context, message)
@@ -942,20 +953,12 @@ module Protovalidate
           return if map_value.nil? || map_value.size.zero?
           return if @ignore == :IGNORE_ALWAYS
 
-          field_elem = FieldPathElement.new(
-            field_number: @field.number,
-            field_name: @field.name,
-            field_type: :message
-          )
+          map_value.each do |key, value|
+            break if context.done?
 
-          context.with_field_path_element(field_elem) do
-            map_value.each do |key, value|
-              break if context.done?
-
-              key_elem = build_key_element(key)
-              context.with_field_path_element(key_elem) do
-                validate_value(context, value)
-              end
+            key_elem = build_key_element(key)
+            context.with_field_path_element(key_elem) do
+              validate_value(context, value)
             end
           end
         end
@@ -964,15 +967,20 @@ module Protovalidate
 
         def validate_value(context, value)
           # For message values, recursively validate
-          # Check if value is a protobuf message (not primitive, not RepeatedField/Map)
-          return unless value.is_a?(Google::Protobuf::MessageExts)
+          if value.is_a?(Google::Protobuf::MessageExts)
+            descriptor = value.class.descriptor
+            rules = @factory.get(descriptor)
 
-          descriptor = value.class.descriptor
-          rules = @factory.get(descriptor)
-
-          rules.each do |rule|
-            rule.validate(context, value)
-            break if context.done?
+            rules.each do |rule|
+              rule.validate(context, value)
+              break if context.done?
+            end
+          else
+            # For scalar values, use the pre-compiled value rules
+            @value_rules.each do |rule|
+              rule.validate_item(context, value)
+              break if context.done?
+            end
           end
         end
 
@@ -989,7 +997,9 @@ module Protovalidate
             field_name: @field.name,
             field_type: :message,
             subscript: key,
-            subscript_type: subscript_type
+            subscript_type: subscript_type,
+            key_type: @key_type,
+            value_type: @value_type
           )
         end
       end
@@ -1016,7 +1026,7 @@ module Protovalidate
           end
 
           value = message.send(@field.name)
-          return if should_ignore?(value)
+          return if should_ignore?(message, value)
 
           return if check_value(value)
 
@@ -1040,7 +1050,7 @@ module Protovalidate
 
         private
 
-        def should_ignore?(value)
+        def should_ignore?(message, value)
           # Handle both symbol and integer enum values from protobuf
           ignore_value = normalize_ignore(@ignore)
 
@@ -1048,7 +1058,21 @@ module Protovalidate
           when :IGNORE_ALWAYS
             true
           when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
-            empty_value?(value)
+            # For fields with explicit presence (proto2 optional, proto3 optional, editions explicit),
+            # only ignore if the field is not set. For implicit presence, ignore if zero-value.
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              empty_value?(value)
+            end
+          when :IGNORE_UNSPECIFIED
+            # For IGNORE_UNSPECIFIED, fields with explicit presence should be ignored if not set.
+            # For fields with implicit presence, don't ignore (validate even zero values).
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              false
+            end
           else
             false
           end
@@ -1075,6 +1099,8 @@ module Protovalidate
           when TrueClass then false
           when Array then value.empty?
           when Hash then value.empty?
+          when Google::Protobuf::RepeatedField then value.empty?
+          when Google::Protobuf::Map then value.size.zero?
           else
             false
           end
@@ -1881,6 +1907,130 @@ module Protovalidate
         end
       end
 
+      # Validates that a string is a valid host:port combination.
+      class StringHostAndPortRule < DirectFieldRule
+        def initialize(field:, port_required: true, ignore: :IGNORE_UNSPECIFIED)
+          constraint_id = port_required ? "string.host_and_port" : "string.host_and_port.optional_port"
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: constraint_id,
+            message: port_required ? "value must be a valid host and port pair" : "value must be a host and (optional) port pair",
+            rule_path: RulePath.build(:string, :host_and_port)
+          )
+          @port_required = port_required
+          @base_constraint_id = constraint_id
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          # Special handling for empty values - use _empty suffix for constraint_id
+          if value.empty?
+            @constraint_id = "#{@base_constraint_id}_empty"
+          else
+            @constraint_id = @base_constraint_id
+          end
+
+          unless check_value(value)
+            field_elem = build_field_path_element
+
+            context.with_field_path_element(field_elem) do
+              violation = Violation.new(
+                constraint_id: @constraint_id,
+                message: @message,
+                rule_path: @rule_path.dup
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty? || value =~ /\A\s/ || value =~ /\s\z/
+
+          # Handle IPv6 addresses in brackets
+          if value.start_with?("[")
+            bracket_end = value.index("]")
+            return false unless bracket_end
+
+            host = value[1...bracket_end]
+            rest = value[(bracket_end + 1)..]
+
+            return false unless valid_ipv6?(host)
+
+            if rest.empty?
+              !@port_required
+            elsif rest.start_with?(":")
+              port = rest[1..]
+              valid_port?(port)
+            else
+              false
+            end
+          else
+            parts = value.split(":", -1)
+            if parts.length == 1
+              !@port_required && (valid_hostname?(parts[0]) || valid_ipv4?(parts[0]))
+            elsif parts.length == 2
+              (valid_hostname?(parts[0]) || valid_ipv4?(parts[0])) && valid_port?(parts[1])
+            else
+              false
+            end
+          end
+        end
+
+        private
+
+        def valid_hostname?(str)
+          return false if str.empty?
+          return false if str.length > 253
+
+          # Reject if it looks like an IP address (all numeric labels)
+          labels = str.chomp(".").split(".")
+          return false if labels.all? { |l| l =~ /\A\d+\z/ }
+
+          # Hostname validation pattern
+          pattern = /\A(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?\z/
+          str.match?(pattern)
+        end
+
+        def valid_ipv4?(str)
+          return false if str.empty?
+
+          parts = str.split(".")
+          return false unless parts.length == 4
+
+          parts.all? do |part|
+            return false if part.empty? || part =~ /\A0\d/
+            num = part.to_i
+            part =~ /\A\d+\z/ && num >= 0 && num <= 255
+          end
+        end
+
+        def valid_ipv6?(str)
+          return false if str.empty?
+
+          require "ipaddr"
+          IPAddr.new(str).ipv6?
+        rescue IPAddr::InvalidAddressError
+          false
+        end
+
+        def valid_port?(port_str)
+          return false if port_str.empty?
+          return false unless port_str.match?(/\A\d+\z/)
+
+          port = port_str.to_i
+          port >= 0 && port <= 65535
+        end
+      end
+
       # Validates bytes length.
       class BytesLenRule < DirectFieldRule
         def initialize(field:, len:, ignore: :IGNORE_UNSPECIFIED)
@@ -2119,6 +2269,441 @@ module Protovalidate
             value.bytesize == 16
           else
             value.bytesize == 4 || value.bytesize == 16
+          end
+        end
+      end
+
+      # =========================================================================
+      # Item Rules - For validating items in repeated fields (scalars)
+      # These rules work with values directly instead of extracting from messages
+      # =========================================================================
+
+      # Base class for item validation rules
+      class ItemRule < Base
+        def initialize(field:, constraint_id:, message:, ignore: :IGNORE_UNSPECIFIED, type_name: nil, rule_element: :const, for_map: false, map_part: nil)
+          super()
+          @field = field
+          @constraint_id = constraint_id
+          @message = message
+          @ignore = ignore
+          @type_name = type_name
+          @for_map = for_map
+          @map_part = map_part  # :keys or :values
+          @rule_path = type_name ? build_rule_path(type_name.to_sym, rule_element) : []
+        end
+
+        # Builds a rule path based on context (repeated items or map keys/values)
+        def build_rule_path(type_name, rule_element)
+          if @for_map
+            build_map_rule_path(type_name, rule_element)
+          else
+            build_item_rule_path(type_name, rule_element)
+          end
+        end
+
+        # Builds a rule path for map keys/values: map.<keys|values>.<type>.<rule>
+        def build_map_rule_path(type_name, rule_element)
+          # Field numbers from validate.proto
+          map_field = 19  # map field in FieldConstraints
+          keys_field = 4  # keys field in MapRules
+          values_field = 5  # values field in MapRules
+
+          # Type field numbers in FieldConstraints
+          type_field_numbers = {
+            int32: 3, int64: 4, sint32: 7, sint64: 8, sfixed32: 11, sfixed64: 12,
+            uint32: 5, uint64: 6, fixed32: 9, fixed64: 10,
+            float: 1, double: 2, string: 14, bytes: 15, bool: 13, enum: 16
+          }
+
+          # Rule field numbers within type-specific rules
+          numeric_rule_numbers = {
+            const: 1, lt: 2, lte: 3, gt: 4, gte: 5, in: 6, not_in: 7
+          }
+
+          type_field = type_field_numbers[type_name] || 0
+          rule_field = numeric_rule_numbers[rule_element] || 0
+
+          # Determine field type for the rule element
+          rule_field_type = case rule_element
+                            when :const, :lt, :lte, :gt, :gte then type_name
+                            when :in, :not_in then type_name
+                            else :message
+                            end
+
+          part_field = @map_part == :keys ? keys_field : values_field
+          part_name = @map_part == :keys ? "keys" : "values"
+
+          # Build elements in reverse order (finalize_violations will reverse)
+          [
+            FieldPathElement.new(
+              field_number: rule_field,
+              field_name: rule_element.to_s,
+              field_type: rule_field_type
+            ),
+            FieldPathElement.new(
+              field_number: type_field,
+              field_name: type_name.to_s,
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: part_field,
+              field_name: part_name,
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: map_field,
+              field_name: "map",
+              field_type: :message
+            )
+          ]
+        end
+
+        # Builds a rule path for item-level rules: repeated.items.<type>.<rule>
+        def build_item_rule_path(type_name, rule_element)
+          # Field numbers from validate.proto
+          repeated_field = 18  # repeated field in FieldConstraints
+          items_field = 4      # items field in RepeatedRules
+
+          # Type field numbers in FieldConstraints (for the items constraint)
+          type_field_numbers = {
+            int32: 3, int64: 4, sint32: 7, sint64: 8, sfixed32: 11, sfixed64: 12,
+            uint32: 5, uint64: 6, fixed32: 9, fixed64: 10,
+            float: 1, double: 2, string: 14, bytes: 15, bool: 13, enum: 16
+          }
+
+          # Rule field numbers within type-specific rules
+          numeric_rule_numbers = {
+            const: 1, lt: 2, lte: 3, gt: 4, gte: 5, in: 6, not_in: 7
+          }
+
+          type_field = type_field_numbers[type_name] || 0
+          rule_field = numeric_rule_numbers[rule_element] || 0
+
+          # Determine field type for the rule element
+          rule_field_type = case rule_element
+                            when :const then type_name
+                            when :lt, :lte, :gt, :gte then type_name
+                            when :in, :not_in then type_name
+                            else :message
+                            end
+
+          # Build elements in reverse order (finalize_violations will reverse)
+          # So we want: [gt, int32, items, repeated] which becomes [repeated, items, int32, gt]
+          [
+            FieldPathElement.new(
+              field_number: rule_field,
+              field_name: rule_element.to_s,
+              field_type: rule_field_type
+            ),
+            FieldPathElement.new(
+              field_number: type_field,
+              field_name: type_name.to_s,
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: items_field,
+              field_name: "items",
+              field_type: :message
+            ),
+            FieldPathElement.new(
+              field_number: repeated_field,
+              field_name: "repeated",
+              field_type: :message
+            )
+          ]
+        end
+
+        def validate_item(context, value)
+          return if context.done?
+          return if should_ignore_item?(value)
+          return if check_value(value)
+
+          violation = Violation.new(
+            constraint_id: @constraint_id,
+            message: @message,
+            rule_path: @rule_path
+          )
+          violation.field_value = value
+          context.add(violation)
+        end
+
+        protected
+
+        def check_value(_value)
+          raise NotImplementedError, "Subclasses must implement #check_value"
+        end
+
+        private
+
+        def should_ignore_item?(value)
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
+          when :IGNORE_ALWAYS
+            true
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
+            empty_value?(value)
+          else
+            false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
+          end
+        end
+
+        def empty_value?(value)
+          return true if value.nil?
+
+          case value
+          when String then value.empty?
+          when Numeric then value.zero?
+          when FalseClass then true
+          when TrueClass then false
+          when Array then value.empty?
+          when Hash then value.empty?
+          else
+            false
+          end
+        end
+      end
+
+      # Item numeric greater than
+      class ItemNumericGtRule < ItemRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gt",
+            message: "value must be greater than #{bound}",
+            type_name: type_name,
+            rule_element: :gt,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value > @bound
+        end
+      end
+
+      # Item numeric greater than or equal
+      class ItemNumericGteRule < ItemRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.gte",
+            message: "value must be greater than or equal to #{bound}",
+            type_name: type_name,
+            rule_element: :gte,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value >= @bound
+        end
+      end
+
+      # Item numeric less than
+      class ItemNumericLtRule < ItemRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.lt",
+            message: "value must be less than #{bound}",
+            type_name: type_name,
+            rule_element: :lt,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value < @bound
+        end
+      end
+
+      # Item numeric less than or equal
+      class ItemNumericLteRule < ItemRule
+        def initialize(field:, bound:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.lte",
+            message: "value must be less than or equal to #{bound}",
+            type_name: type_name,
+            rule_element: :lte,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @bound = bound
+        end
+
+        protected
+
+        def check_value(value)
+          value <= @bound
+        end
+      end
+
+      # Item numeric const
+      class ItemNumericConstRule < ItemRule
+        def initialize(field:, const:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.const",
+            message: "value must equal #{const}",
+            type_name: type_name,
+            rule_element: :const,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @const = const
+        end
+
+        protected
+
+        def check_value(value)
+          value == @const
+        end
+      end
+
+      # Item numeric in
+      class ItemNumericInRule < ItemRule
+        def initialize(field:, allowed:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.in",
+            message: "value must be in #{allowed.inspect}",
+            type_name: type_name,
+            rule_element: :in,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @allowed = allowed
+        end
+
+        protected
+
+        def check_value(value)
+          @allowed.include?(value)
+        end
+      end
+
+      # Item numeric not_in
+      class ItemNumericNotInRule < ItemRule
+        def initialize(field:, disallowed:, type_name:, ignore: :IGNORE_UNSPECIFIED, for_map: false, map_part: nil)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "#{type_name}.not_in",
+            message: "value must not be in #{disallowed.inspect}",
+            type_name: type_name,
+            rule_element: :not_in,
+            for_map: for_map,
+            map_part: map_part
+          )
+          @disallowed = disallowed
+        end
+
+        protected
+
+        def check_value(value)
+          !@disallowed.include?(value)
+        end
+      end
+
+      # Item CEL rule - validates items using CEL expressions
+      class ItemCelRule < Base
+        def initialize(field:, program:, constraint_id:, message:, ignore: :IGNORE_UNSPECIFIED)
+          super()
+          @field = field
+          @program = program
+          @constraint_id = constraint_id
+          @message = message
+          @ignore = ignore
+        end
+
+        def validate_item(context, value)
+          return if context.done?
+          return if should_ignore_item?(value)
+
+          activation = { "this" => CelHelpers.ruby_to_cel(value) }
+          result = @program.evaluate(activation)
+
+          unless result == true || (result.respond_to?(:value) && result.value == true)
+            violation = Violation.new(
+              constraint_id: @constraint_id,
+              message: @message
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        rescue Cel::EvaluateError => e
+          raise RuntimeError.new("CEL evaluation failed for item: #{e.message}", cause: e)
+        end
+
+        private
+
+        def should_ignore_item?(value)
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
+          when :IGNORE_ALWAYS
+            true
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
+            empty_value?(value)
+          else
+            false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
+          end
+        end
+
+        def empty_value?(value)
+          return true if value.nil?
+
+          case value
+          when String then value.empty?
+          when Numeric then value.zero?
+          when FalseClass then true
+          when TrueClass then false
+          when Array then value.empty?
+          when Hash then value.empty?
+          else
+            false
           end
         end
       end

@@ -151,18 +151,28 @@ module Protovalidate
     # @return [Symbol, nil] The subscript type (:index, :bool_key, :int_key, :uint_key, :string_key)
     attr_reader :subscript_type
 
+    # @return [Symbol, nil] The key type for map fields
+    attr_reader :key_type
+
+    # @return [Symbol, nil] The value type for map fields
+    attr_reader :value_type
+
     def initialize(
       field_number:,
       field_name:,
       field_type:,
       subscript: nil,
-      subscript_type: nil
+      subscript_type: nil,
+      key_type: nil,
+      value_type: nil
     )
       @field_number = field_number
       @field_name = field_name
       @field_type = field_type
       @subscript = subscript
       @subscript_type = subscript_type
+      @key_type = key_type
+      @value_type = value_type
     end
 
     # Returns the subscript as a string for display.
@@ -195,6 +205,14 @@ module Protovalidate
         field_type: field_type_to_proto
       )
 
+      # Set key_type and value_type for map fields
+      if key_type
+        elem.key_type = type_symbol_to_proto(key_type)
+      end
+      if value_type
+        elem.value_type = type_symbol_to_proto(value_type)
+      end
+
       case subscript_type
       when :index
         elem.index = subscript
@@ -213,30 +231,33 @@ module Protovalidate
 
     private
 
-    def field_type_to_proto
-      # Maps Ruby symbols to protobuf FieldDescriptorProto::Type values
-      type_map = {
-        double: :TYPE_DOUBLE,
-        float: :TYPE_FLOAT,
-        int64: :TYPE_INT64,
-        uint64: :TYPE_UINT64,
-        int32: :TYPE_INT32,
-        fixed64: :TYPE_FIXED64,
-        fixed32: :TYPE_FIXED32,
-        bool: :TYPE_BOOL,
-        string: :TYPE_STRING,
-        group: :TYPE_GROUP,
-        message: :TYPE_MESSAGE,
-        bytes: :TYPE_BYTES,
-        uint32: :TYPE_UINT32,
-        enum: :TYPE_ENUM,
-        sfixed32: :TYPE_SFIXED32,
-        sfixed64: :TYPE_SFIXED64,
-        sint32: :TYPE_SINT32,
-        sint64: :TYPE_SINT64
-      }
+    TYPE_MAP = {
+      double: :TYPE_DOUBLE,
+      float: :TYPE_FLOAT,
+      int64: :TYPE_INT64,
+      uint64: :TYPE_UINT64,
+      int32: :TYPE_INT32,
+      fixed64: :TYPE_FIXED64,
+      fixed32: :TYPE_FIXED32,
+      bool: :TYPE_BOOL,
+      string: :TYPE_STRING,
+      group: :TYPE_GROUP,
+      message: :TYPE_MESSAGE,
+      bytes: :TYPE_BYTES,
+      uint32: :TYPE_UINT32,
+      enum: :TYPE_ENUM,
+      sfixed32: :TYPE_SFIXED32,
+      sfixed64: :TYPE_SFIXED64,
+      sint32: :TYPE_SINT32,
+      sint64: :TYPE_SINT64
+    }.freeze
 
-      type_map[field_type] || :TYPE_MESSAGE
+    def field_type_to_proto
+      TYPE_MAP[field_type] || :TYPE_MESSAGE
+    end
+
+    def type_symbol_to_proto(type_sym)
+      TYPE_MAP[type_sym] || :TYPE_MESSAGE
     end
   end
 end

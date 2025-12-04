@@ -76,6 +76,18 @@ module Protovalidate
         def value_to_cel(value, field)
           return nil if value.nil?
 
+          # Handle repeated fields (convert to CEL List)
+          if value.is_a?(Google::Protobuf::RepeatedField)
+            return Cel::List.new(value.to_a.map { |v| ruby_to_cel(v) })
+          end
+
+          # Handle map fields (convert to CEL Map)
+          if value.is_a?(Google::Protobuf::Map)
+            converted = {}
+            value.each { |k, v| converted[ruby_to_cel(k)] = ruby_to_cel(v) }
+            return Cel::Map.new(converted)
+          end
+
           case field&.type
           when :message
             if value.is_a?(Google::Protobuf::MessageExts)
@@ -88,7 +100,28 @@ module Protovalidate
             # Handle both symbol (named) and integer (numeric) enum values
             value.is_a?(Symbol) ? 0 : value.to_i
           else
-            value
+            ruby_to_cel(value)
+          end
+        end
+
+        # Converts a Ruby value to its CEL equivalent
+        def ruby_to_cel(value)
+          return Cel::Null.new if value.nil?
+
+          case value
+          when String then Cel::String.new(value)
+          when Integer then Cel::Number.new(:int, value)
+          when Float then Cel::Number.new(:double, value)
+          when TrueClass, FalseClass then Cel::Bool.new(value)
+          when Array then Cel::List.new(value.map { |v| ruby_to_cel(v) })
+          when Hash then Cel::Map.new(value.transform_keys { |k| ruby_to_cel(k) }.transform_values { |v| ruby_to_cel(v) })
+          when Google::Protobuf::RepeatedField then Cel::List.new(value.to_a.map { |v| ruby_to_cel(v) })
+          when Google::Protobuf::Map
+            converted = {}
+            value.each { |k, v| converted[ruby_to_cel(k)] = ruby_to_cel(v) }
+            Cel::Map.new(converted)
+          when Google::Protobuf::MessageExts then message_to_cel(value)
+          else value
           end
         end
 

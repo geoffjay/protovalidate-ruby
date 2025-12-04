@@ -51,8 +51,11 @@ module Protovalidate
 
       def build_cel_environment
         # Build a CEL environment with protovalidate functions
+        # Disable type checking because we can't declare the type of 'this'
+        # which varies per field (scalar, repeated, message, etc.)
         Cel::Environment.new(
-          declarations: CelHelpers.declarations
+          declarations: CelHelpers.declarations,
+          disable_check: true
         )
       end
 
@@ -231,7 +234,11 @@ module Protovalidate
         when :enum
           rules.concat(compile_enum_rules(field, constraint.enum, ignore, oneof_name)) if constraint.enum
         when :message
-          rules.concat(compile_message_field_rules(field, constraint, ignore)) unless is_map
+          # Only add SubMessageRule for singular message fields (not repeated, not map)
+          # Repeated message validation is handled by RepeatedItemsRule.validate_item
+          unless is_map || field.label == :repeated
+            rules.concat(compile_message_field_rules(field, constraint, ignore))
+          end
         end
 
         # Handle repeated fields (but not maps, which are also repeated)
@@ -338,6 +345,7 @@ module Protovalidate
         rules << Rules::StringUriRule.new(field: field, ignore: ignore) if string_rules.uri
         rules << Rules::StringUriRefRule.new(field: field, ignore: ignore) if string_rules.uri_ref
         rules << Rules::StringUuidRule.new(field: field, ignore: ignore) if string_rules.uuid
+        rules << Rules::StringHostAndPortRule.new(field: field, port_required: true, ignore: ignore) if string_rules.host_and_port
 
         rules
       end
@@ -699,11 +707,14 @@ module Protovalidate
 
         # Item-level rules would be applied to each element
         if repeated_rules.items
+          # Compile item-level rules for scalar types
+          item_rules = compile_item_rules(field, repeated_rules.items, ignore)
           rules << Rules::RepeatedItemsRule.new(
             field: field,
             item_constraints: repeated_rules.items,
             factory: self,
-            ignore: ignore
+            ignore: ignore,
+            item_rules: item_rules
           )
         end
 
@@ -723,26 +734,348 @@ module Protovalidate
                                   "map.max_pairs", "value must contain at most #{map_rules.max_pairs} pairs")
         end
 
+        # Get map entry key/value field descriptors
+        value_field = nil
+        key_field = nil
+        if field.subtype
+          field.subtype.each do |subfield|
+            value_field = subfield if subfield.name == "value"
+            key_field = subfield if subfield.name == "key"
+          end
+        end
+
+        # Get key and value types for field path elements
+        key_type = key_field&.type
+        value_type = value_field&.type
+
         # Key and value rules
-        if map_rules.keys
+        if map_rules.keys && key_field
+          key_rules = compile_map_key_rules(key_field, map_rules.keys, ignore)
           rules << Rules::MapKeysRule.new(
             field: field,
             key_constraints: map_rules.keys,
             factory: self,
-            ignore: ignore
+            ignore: ignore,
+            key_rules: key_rules,
+            key_type: key_type,
+            value_type: value_type
           )
         end
 
-        if map_rules.values
+        if map_rules.values && value_field
+          value_rules = compile_map_value_rules(value_field, map_rules.values, ignore)
           rules << Rules::MapValuesRule.new(
             field: field,
             value_constraints: map_rules.values,
             factory: self,
-            ignore: ignore
+            ignore: ignore,
+            value_rules: value_rules,
+            key_type: key_type,
+            value_type: value_type
           )
         end
 
         rules.compact
+      end
+
+      # Compiles rules for validating map values
+      def compile_map_value_rules(value_field, value_constraints, _parent_ignore)
+        rules = []
+
+        # Use the value constraint's ignore
+        value_ignore = value_constraints.ignore
+
+        # Get the type of values in the map
+        value_type = value_field.type
+
+        case value_type
+        when :int32, :int64, :sint32, :sint64, :sfixed32, :sfixed64
+          rules.concat(compile_int_value_rules(value_field, value_constraints, value_ignore))
+        when :uint32, :uint64, :fixed32, :fixed64
+          rules.concat(compile_uint_value_rules(value_field, value_constraints, value_ignore))
+        when :float, :double
+          rules.concat(compile_float_value_rules(value_field, value_constraints, value_ignore))
+        when :string
+          rules.concat(compile_string_value_rules(value_field, value_constraints.string, value_ignore)) if value_constraints.string
+        when :bytes
+          rules.concat(compile_bytes_value_rules(value_field, value_constraints.bytes, value_ignore)) if value_constraints.bytes
+        when :bool
+          rules.concat(compile_bool_value_rules(value_field, value_constraints.bool, value_ignore)) if value_constraints.bool
+        when :enum
+          rules.concat(compile_enum_value_rules(value_field, value_constraints.enum, value_ignore)) if value_constraints.enum
+        end
+
+        # Handle CEL rules on values
+        if value_constraints.cel && !value_constraints.cel.empty?
+          value_constraints.cel.each_with_index do |cel_rule, idx|
+            rules << build_item_cel_rule(value_field, cel_rule.expression, value_ignore,
+                                         cel_rule.id || "cel[#{idx}]",
+                                         cel_rule.message || "CEL expression evaluated to false")
+          end
+        end
+
+        rules.compact
+      end
+
+      # Compile map value rules for int types
+      def compile_int_value_rules(value_field, constraint, ignore, for_map: true, map_part: :values)
+        rules = []
+        type_name = value_field.type.to_s
+
+        # Look for the numeric rules in the constraint
+        numeric_rules = constraint.send(type_name) rescue nil
+        return rules unless numeric_rules
+
+        if numeric_rules.has_const?
+          rules << Rules::ItemNumericConstRule.new(field: value_field, const: numeric_rules.const, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        case numeric_rules.less_than
+        when :lt
+          rules << Rules::ItemNumericLtRule.new(field: value_field, bound: numeric_rules.lt, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        when :lte
+          rules << Rules::ItemNumericLteRule.new(field: value_field, bound: numeric_rules.lte, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        case numeric_rules.greater_than
+        when :gt
+          rules << Rules::ItemNumericGtRule.new(field: value_field, bound: numeric_rules.gt, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        when :gte
+          rules << Rules::ItemNumericGteRule.new(field: value_field, bound: numeric_rules.gte, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        if numeric_rules.in && !numeric_rules.in.empty?
+          rules << Rules::ItemNumericInRule.new(field: value_field, allowed: numeric_rules.in.to_a, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        if numeric_rules.not_in && !numeric_rules.not_in.empty?
+          rules << Rules::ItemNumericNotInRule.new(field: value_field, disallowed: numeric_rules.not_in.to_a, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        rules
+      end
+
+      def compile_uint_value_rules(value_field, constraint, ignore, for_map: true, map_part: :values)
+        compile_int_value_rules(value_field, constraint, ignore, for_map: for_map, map_part: map_part)
+      end
+
+      def compile_float_value_rules(value_field, constraint, ignore, for_map: true, map_part: :values)
+        rules = []
+        type_name = value_field.type.to_s
+
+        numeric_rules = constraint.send(type_name) rescue nil
+        return rules unless numeric_rules
+
+        if numeric_rules.has_const?
+          rules << Rules::ItemNumericConstRule.new(field: value_field, const: numeric_rules.const, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        case numeric_rules.less_than
+        when :lt
+          rules << Rules::ItemNumericLtRule.new(field: value_field, bound: numeric_rules.lt, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        when :lte
+          rules << Rules::ItemNumericLteRule.new(field: value_field, bound: numeric_rules.lte, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        case numeric_rules.greater_than
+        when :gt
+          rules << Rules::ItemNumericGtRule.new(field: value_field, bound: numeric_rules.gt, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        when :gte
+          rules << Rules::ItemNumericGteRule.new(field: value_field, bound: numeric_rules.gte, type_name: type_name, ignore: ignore, for_map: for_map, map_part: map_part)
+        end
+
+        rules
+      end
+
+      def compile_string_value_rules(_field, _string_rules, _ignore)
+        # TODO: Implement string value rules
+        []
+      end
+
+      def compile_bytes_value_rules(_field, _bytes_rules, _ignore)
+        # TODO: Implement bytes value rules
+        []
+      end
+
+      def compile_bool_value_rules(_field, _bool_rules, _ignore)
+        # TODO: Implement bool value rules
+        []
+      end
+
+      def compile_enum_value_rules(_field, _enum_rules, _ignore)
+        # TODO: Implement enum value rules
+        []
+      end
+
+      # Compile map key rules
+      def compile_map_key_rules(key_field, key_constraints, _parent_ignore)
+        # Similar to value rules but for keys
+        # Keys can only be integral types or strings
+        rules = []
+        key_ignore = key_constraints.ignore
+
+        case key_field.type
+        when :int32, :int64, :sint32, :sint64, :sfixed32, :sfixed64
+          rules.concat(compile_int_value_rules(key_field, key_constraints, key_ignore, for_map: true, map_part: :keys))
+        when :uint32, :uint64, :fixed32, :fixed64
+          rules.concat(compile_uint_value_rules(key_field, key_constraints, key_ignore, for_map: true, map_part: :keys))
+        when :string
+          rules.concat(compile_string_value_rules(key_field, key_constraints.string, key_ignore)) if key_constraints.string
+        when :bool
+          rules.concat(compile_bool_value_rules(key_field, key_constraints.bool, key_ignore)) if key_constraints.bool
+        end
+
+        rules.compact
+      end
+
+      # Compiles rules for validating individual items in a repeated field
+      def compile_item_rules(field, item_constraints, _parent_ignore)
+        rules = []
+
+        # Use the item constraint's ignore, not the parent's
+        item_ignore = item_constraints.ignore
+
+        # Get the type of items in the repeated field
+        item_type = field.type
+
+        case item_type
+        when :int32, :int64, :sint32, :sint64, :sfixed32, :sfixed64
+          rules.concat(compile_int_item_rules(field, item_constraints, item_ignore))
+        when :uint32, :uint64, :fixed32, :fixed64
+          rules.concat(compile_uint_item_rules(field, item_constraints, item_ignore))
+        when :float, :double
+          rules.concat(compile_float_item_rules(field, item_constraints, item_ignore))
+        when :string
+          rules.concat(compile_string_item_rules(field, item_constraints.string, item_ignore)) if item_constraints.string
+        when :bytes
+          rules.concat(compile_bytes_item_rules(field, item_constraints.bytes, item_ignore)) if item_constraints.bytes
+        when :bool
+          rules.concat(compile_bool_item_rules(field, item_constraints.bool, item_ignore)) if item_constraints.bool
+        when :enum
+          rules.concat(compile_enum_item_rules(field, item_constraints.enum, item_ignore)) if item_constraints.enum
+        end
+
+        # Handle CEL rules on items
+        if item_constraints.cel && !item_constraints.cel.empty?
+          item_constraints.cel.each_with_index do |cel_rule, idx|
+            rules << build_item_cel_rule(field, cel_rule.expression, item_ignore,
+                                         cel_rule.id || "cel[#{idx}]",
+                                         cel_rule.message || "CEL expression evaluated to false")
+          end
+        end
+
+        rules.compact
+      end
+
+      def compile_int_item_rules(field, constraint, ignore)
+        rules = []
+        type_name = numeric_type_for(field.type)
+
+        # Look for the numeric rules in the constraint
+        numeric_rules = constraint.send(type_name) rescue nil
+        return rules unless numeric_rules
+
+        if numeric_rules.has_const?
+          rules << Rules::ItemNumericConstRule.new(field: field, const: numeric_rules.const, type_name: type_name, ignore: ignore)
+        end
+
+        case numeric_rules.less_than
+        when :lt
+          rules << Rules::ItemNumericLtRule.new(field: field, bound: numeric_rules.lt, type_name: type_name, ignore: ignore)
+        when :lte
+          rules << Rules::ItemNumericLteRule.new(field: field, bound: numeric_rules.lte, type_name: type_name, ignore: ignore)
+        end
+
+        case numeric_rules.greater_than
+        when :gt
+          rules << Rules::ItemNumericGtRule.new(field: field, bound: numeric_rules.gt, type_name: type_name, ignore: ignore)
+        when :gte
+          rules << Rules::ItemNumericGteRule.new(field: field, bound: numeric_rules.gte, type_name: type_name, ignore: ignore)
+        end
+
+        if numeric_rules.in && !numeric_rules.in.empty?
+          rules << Rules::ItemNumericInRule.new(field: field, allowed: numeric_rules.in.to_a, type_name: type_name, ignore: ignore)
+        end
+
+        if numeric_rules.not_in && !numeric_rules.not_in.empty?
+          rules << Rules::ItemNumericNotInRule.new(field: field, disallowed: numeric_rules.not_in.to_a, type_name: type_name, ignore: ignore)
+        end
+
+        rules
+      end
+
+      def compile_uint_item_rules(field, constraint, ignore)
+        compile_int_item_rules(field, constraint, ignore)
+      end
+
+      def compile_float_item_rules(field, constraint, ignore)
+        rules = []
+        type_name = numeric_type_for(field.type)
+
+        # Look for the numeric rules in the constraint
+        numeric_rules = constraint.send(type_name) rescue nil
+        return rules unless numeric_rules
+
+        if numeric_rules.has_const?
+          rules << Rules::ItemNumericConstRule.new(field: field, const: numeric_rules.const, type_name: type_name, ignore: ignore)
+        end
+
+        case numeric_rules.less_than
+        when :lt
+          rules << Rules::ItemNumericLtRule.new(field: field, bound: numeric_rules.lt, type_name: type_name, ignore: ignore)
+        when :lte
+          rules << Rules::ItemNumericLteRule.new(field: field, bound: numeric_rules.lte, type_name: type_name, ignore: ignore)
+        end
+
+        case numeric_rules.greater_than
+        when :gt
+          rules << Rules::ItemNumericGtRule.new(field: field, bound: numeric_rules.gt, type_name: type_name, ignore: ignore)
+        when :gte
+          rules << Rules::ItemNumericGteRule.new(field: field, bound: numeric_rules.gte, type_name: type_name, ignore: ignore)
+        end
+
+        if numeric_rules.in && !numeric_rules.in.empty?
+          rules << Rules::ItemNumericInRule.new(field: field, allowed: numeric_rules.in.to_a, type_name: type_name, ignore: ignore)
+        end
+
+        if numeric_rules.not_in && !numeric_rules.not_in.empty?
+          rules << Rules::ItemNumericNotInRule.new(field: field, disallowed: numeric_rules.not_in.to_a, type_name: type_name, ignore: ignore)
+        end
+
+        rules
+      end
+
+      def compile_string_item_rules(_field, _string_rules, _ignore)
+        # TODO: Implement string item rules
+        []
+      end
+
+      def compile_bytes_item_rules(_field, _bytes_rules, _ignore)
+        # TODO: Implement bytes item rules
+        []
+      end
+
+      def compile_bool_item_rules(_field, _bool_rules, _ignore)
+        # TODO: Implement bool item rules
+        []
+      end
+
+      def compile_enum_item_rules(_field, _enum_rules, _ignore)
+        # TODO: Implement enum item rules
+        []
+      end
+
+      def build_item_cel_rule(field, expression, ignore, constraint_id, message)
+        program = compile_cel_expression(expression, field, :field)
+        Rules::ItemCelRule.new(
+          field: field,
+          program: program,
+          constraint_id: constraint_id,
+          message: message,
+          ignore: ignore
+        )
+      rescue StandardError => e
+        raise CompilationError.new("Failed to compile item CEL expression '#{expression}': #{e.message}", cause: e)
       end
 
       def build_cel_rule(field, expression, ignore, constraint_id, message)
@@ -768,6 +1101,11 @@ module Protovalidate
         @cel_env.program(expression)
       rescue Cel::ParseError, Cel::CheckError => e
         raise CompilationError.new("Invalid CEL expression '#{expression}': #{e.message}", cause: e)
+      end
+
+      def numeric_type_for(type_name)
+        # Return the actual field type, not the wire type
+        type_name
       end
     end
   end

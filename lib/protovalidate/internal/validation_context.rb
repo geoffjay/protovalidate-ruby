@@ -89,10 +89,13 @@ module Protovalidate
       end
 
       # Finalizes violation paths by reversing the breadcrumb trail.
+      # Uses non-mutating reverse to avoid affecting cached rule paths.
       def finalize_violations
         @violations.each do |violation|
-          violation.field_path&.elements&.reverse!
-          violation.rule_path.reverse!
+          if violation.field_path&.elements
+            violation.field_path = FieldPath.new(violation.field_path.elements.reverse)
+          end
+          violation.rule_path = violation.rule_path.reverse
         end
       end
     end

@@ -16,6 +16,7 @@
 
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 $LOAD_PATH.unshift File.expand_path("../gen", __dir__)
+$LOAD_PATH.unshift File.expand_path("../contrib/cel-ruby/lib", __dir__)
 
 require "google/protobuf"
 require "google/protobuf/any_pb"
@@ -180,6 +181,14 @@ module Protovalidate
             field_name: elem.field_name,
             field_type: field_type_to_proto(elem.field_type)
           )
+
+          # Set key_type and value_type for map fields
+          if elem.key_type
+            proto_elem.key_type = field_type_to_proto(elem.key_type)
+          end
+          if elem.value_type
+            proto_elem.value_type = field_type_to_proto(elem.value_type)
+          end
 
           # Set subscript if present
           case elem.subscript_type
