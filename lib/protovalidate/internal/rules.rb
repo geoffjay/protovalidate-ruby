@@ -227,7 +227,10 @@ module Protovalidate
 
       # Validates a CEL expression at the field level.
       class FieldCelRule < Base
-        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, oneof_name: nil)
+        # Field number for 'cel' in FieldConstraints
+        CEL_FIELD_NUMBER = 23
+
+        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, oneof_name: nil, cel_index: 0)
           super()
           @field = field
           @program = program
@@ -235,6 +238,7 @@ module Protovalidate
           @cel_env = cel_env
           @ignore = ignore
           @oneof_name = oneof_name
+          @cel_index = cel_index
         end
 
         def validate(context, message)
@@ -260,7 +264,8 @@ module Protovalidate
             unless result == true || (result.respond_to?(:value) && result.value == true)
               violation = Violation.new(
                 constraint_id: @rule.id || "",
-                message: @rule.message || "CEL expression evaluated to false"
+                message: @rule.message || "CEL expression evaluated to false",
+                rule_path: build_cel_rule_path
               )
               violation.field_value = value
               context.add(violation)
@@ -339,6 +344,18 @@ module Protovalidate
             field_name: @field.name,
             field_type: @field.type
           )
+        end
+
+        def build_cel_rule_path
+          [
+            FieldPathElement.new(
+              field_number: CEL_FIELD_NUMBER,
+              field_name: "cel",
+              field_type: :message,
+              subscript: @cel_index,
+              subscript_type: :index
+            )
+          ]
         end
       end
 
@@ -2031,6 +2048,142 @@ module Protovalidate
         end
       end
 
+      # Validates strings against well-known regex patterns (HTTP header names/values).
+      class StringWellKnownRegexRule < DirectFieldRule
+        KNOWN_REGEX_HTTP_HEADER_NAME = 1
+        KNOWN_REGEX_HTTP_HEADER_VALUE = 2
+
+        def initialize(field:, regex_type:, strict: true, ignore: :IGNORE_UNSPECIFIED)
+          regex_type_value = regex_type.is_a?(Symbol) ? resolve_regex_type(regex_type) : regex_type.to_i
+          type_name = regex_type_value == KNOWN_REGEX_HTTP_HEADER_NAME ? "header_name" : "header_value"
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.well_known_regex.#{type_name}",
+            message: "value must be a valid HTTP #{type_name.tr('_', ' ')}",
+            rule_path: RulePath.build(:string, :well_known_regex)
+          )
+          @regex_type = regex_type_value
+          @strict = strict
+          @base_constraint_id = "string.well_known_regex.#{type_name}"
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          # Check for empty values - empty is invalid for header names, but valid for header values
+          if value.nil? || value.empty?
+            if @regex_type == KNOWN_REGEX_HTTP_HEADER_NAME
+              report_violation(context, value, "_empty")
+            end
+            return
+          end
+
+          valid = case @regex_type
+                  when KNOWN_REGEX_HTTP_HEADER_NAME
+                    @strict ? valid_http_header_name_strict?(value) : valid_http_header_name_loose?(value)
+                  when KNOWN_REGEX_HTTP_HEADER_VALUE
+                    @strict ? valid_http_header_value_strict?(value) : valid_http_header_value_loose?(value)
+                  else
+                    true
+                  end
+
+          report_violation(context, value, "") unless valid
+        end
+
+        private
+
+        def resolve_regex_type(type_symbol)
+          case type_symbol
+          when :KNOWN_REGEX_HTTP_HEADER_NAME then KNOWN_REGEX_HTTP_HEADER_NAME
+          when :KNOWN_REGEX_HTTP_HEADER_VALUE then KNOWN_REGEX_HTTP_HEADER_VALUE
+          else 0
+          end
+        end
+
+        def report_violation(context, value, suffix)
+          field_elem = build_field_path_element
+          context.with_field_path_element(field_elem) do
+            violation = Violation.new(
+              constraint_id: "#{@base_constraint_id}#{suffix}",
+              message: @message,
+              rule_path: @rule_path
+            )
+            violation.field_value = value
+            context.add(violation)
+          end
+        end
+
+        # Strict HTTP header name: RFC 9110 token chars + HTTP/2 pseudo headers
+        # token = 1*tchar
+        # tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+        # Plus: HTTP/2 pseudo headers start with ":"
+        def valid_http_header_name_strict?(value)
+          return false if value.empty?
+
+          # HTTP/2 pseudo headers (like :authority, :path) start with colon
+          if value.start_with?(":")
+            # Pseudo header: must be colon followed by valid chars
+            return false if value.length == 1 # Solo colon is invalid
+            value[1..].each_byte do |byte|
+              return false unless valid_token_char?(byte)
+            end
+            return true
+          end
+
+          # Regular header: token chars only, no colons
+          value.each_byte do |byte|
+            return false unless valid_token_char?(byte)
+          end
+          true
+        end
+
+        # Loose HTTP header name: allows colons except at start/end
+        def valid_http_header_name_loose?(value)
+          return false if value.empty?
+          # No CR, LF, NUL
+          value.each_byte do |byte|
+            return false if byte == 0x00 || byte == 0x0A || byte == 0x0D
+          end
+          # No colon at start or end
+          return false if value.start_with?(":") || value.end_with?(":")
+          true
+        end
+
+        # Strict HTTP header value: visible ASCII + SP + HTAB
+        def valid_http_header_value_strict?(value)
+          value.each_byte do |byte|
+            # Allow SP (0x20), HTAB (0x09), visible ASCII (0x21-0x7E)
+            # Reject NUL, CR, LF, DEL (0x7F), and other control chars
+            next if byte == 0x20 || byte == 0x09 # SP, HTAB
+            next if byte >= 0x21 && byte <= 0x7E # visible ASCII
+            return false
+          end
+          true
+        end
+
+        # Loose HTTP header value: allows more chars but still rejects NUL, CR, LF
+        def valid_http_header_value_loose?(value)
+          value.each_byte do |byte|
+            return false if byte == 0x00 || byte == 0x0A || byte == 0x0D
+          end
+          true
+        end
+
+        def valid_token_char?(byte)
+          # Token chars per RFC 9110
+          # ALPHA, DIGIT, or one of: !#$%&'*+-.^_`|~
+          return true if (byte >= 0x41 && byte <= 0x5A) || (byte >= 0x61 && byte <= 0x7A) # A-Z, a-z
+          return true if byte >= 0x30 && byte <= 0x39 # 0-9
+          return true if [0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2E, 0x5E, 0x5F, 0x60, 0x7C, 0x7E].include?(byte)
+          # !#$%&'*+-.^_`|~
+          false
+        end
+      end
+
       # Validates bytes length.
       class BytesLenRule < DirectFieldRule
         def initialize(field:, len:, ignore: :IGNORE_UNSPECIFIED)
@@ -2651,7 +2804,7 @@ module Protovalidate
           return if context.done?
           return if should_ignore_item?(value)
 
-          activation = { "this" => CelHelpers.ruby_to_cel(value) }
+          activation = { this: CelHelpers.ruby_to_cel(value), now: Time.now }
           result = @program.evaluate(activation)
 
           unless result == true || (result.respond_to?(:value) && result.value == true)

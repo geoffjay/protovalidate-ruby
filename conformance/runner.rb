@@ -218,11 +218,27 @@ module Protovalidate
         return nil if rule_path.nil? || rule_path.empty?
 
         elements = rule_path.map do |elem|
-          Buf::Validate::FieldPathElement.new(
+          proto_elem = Buf::Validate::FieldPathElement.new(
             field_number: elem.field_number,
             field_name: elem.field_name,
             field_type: field_type_to_proto(elem.field_type)
           )
+
+          # Set subscript if present
+          case elem.subscript_type
+          when :index
+            proto_elem.index = elem.subscript.to_i
+          when :bool_key
+            proto_elem.bool_key = elem.subscript
+          when :int_key
+            proto_elem.int_key = elem.subscript.to_i
+          when :uint_key
+            proto_elem.uint_key = elem.subscript.to_i
+          when :string_key
+            proto_elem.string_key = elem.subscript.to_s
+          end
+
+          proto_elem
         end
 
         Buf::Validate::FieldPath.new(elements: elements)

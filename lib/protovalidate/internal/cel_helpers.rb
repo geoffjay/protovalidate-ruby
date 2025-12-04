@@ -59,6 +59,28 @@ module Protovalidate
           }
         end
 
+        # Converts a Ruby value to its CEL equivalent (public for external use)
+        def ruby_to_cel(value)
+          return Cel::Null.new if value.nil?
+
+          case value
+          when String then Cel::String.new(value)
+          when Integer then Cel::Number.new(:int, value)
+          when Float then Cel::Number.new(:double, value)
+          when TrueClass, FalseClass then Cel::Bool.new(value)
+          when Symbol then Cel::Number.new(:int, 0) # Enum symbols default to 0
+          when Array then Cel::List.new(value.map { |v| ruby_to_cel(v) })
+          when Hash then Cel::Map.new(value.transform_keys { |k| ruby_to_cel(k) }.transform_values { |v| ruby_to_cel(v) })
+          when Google::Protobuf::RepeatedField then Cel::List.new(value.to_a.map { |v| ruby_to_cel(v) })
+          when Google::Protobuf::Map
+            converted = {}
+            value.each { |k, v| converted[ruby_to_cel(k)] = ruby_to_cel(v) }
+            Cel::Map.new(converted)
+          when Google::Protobuf::MessageExts then message_to_cel(value)
+          else value
+          end
+        end
+
         private
 
         def message_to_cel(message)
@@ -73,18 +95,42 @@ module Protovalidate
           result
         end
 
+        # Converts an enum value to its CEL integer representation
+        def convert_enum_to_cel(value, field)
+          if value.is_a?(Symbol)
+            num = field&.subtype&.lookup_name(value) || 0
+            Cel::Number.new(:int, num)
+          else
+            Cel::Number.new(:int, value.to_i)
+          end
+        end
+
         def value_to_cel(value, field)
           return nil if value.nil?
 
           # Handle repeated fields (convert to CEL List)
           if value.is_a?(Google::Protobuf::RepeatedField)
+            # For enum fields, properly convert enum symbols to integers
+            if field&.type == :enum
+              return Cel::List.new(value.to_a.map { |v| convert_enum_to_cel(v, field) })
+            end
             return Cel::List.new(value.to_a.map { |v| ruby_to_cel(v) })
           end
 
           # Handle map fields (convert to CEL Map)
           if value.is_a?(Google::Protobuf::Map)
             converted = {}
-            value.each { |k, v| converted[ruby_to_cel(k)] = ruby_to_cel(v) }
+            # Get the value type from the map entry descriptor
+            value_field = field&.subtype&.lookup("value")
+            value.each do |k, v|
+              cel_key = ruby_to_cel(k)
+              cel_value = if value_field&.type == :enum
+                            convert_enum_to_cel(v, value_field)
+                          else
+                            ruby_to_cel(v)
+                          end
+              converted[cel_key] = cel_value
+            end
             return Cel::Map.new(converted)
           end
 
@@ -97,31 +143,9 @@ module Protovalidate
             end
           when :enum
             # Enums are represented as integers in CEL
-            # Handle both symbol (named) and integer (numeric) enum values
-            value.is_a?(Symbol) ? 0 : value.to_i
+            convert_enum_to_cel(value, field)
           else
             ruby_to_cel(value)
-          end
-        end
-
-        # Converts a Ruby value to its CEL equivalent
-        def ruby_to_cel(value)
-          return Cel::Null.new if value.nil?
-
-          case value
-          when String then Cel::String.new(value)
-          when Integer then Cel::Number.new(:int, value)
-          when Float then Cel::Number.new(:double, value)
-          when TrueClass, FalseClass then Cel::Bool.new(value)
-          when Array then Cel::List.new(value.map { |v| ruby_to_cel(v) })
-          when Hash then Cel::Map.new(value.transform_keys { |k| ruby_to_cel(k) }.transform_values { |v| ruby_to_cel(v) })
-          when Google::Protobuf::RepeatedField then Cel::List.new(value.to_a.map { |v| ruby_to_cel(v) })
-          when Google::Protobuf::Map
-            converted = {}
-            value.each { |k, v| converted[ruby_to_cel(k)] = ruby_to_cel(v) }
-            Cel::Map.new(converted)
-          when Google::Protobuf::MessageExts then message_to_cel(value)
-          else value
           end
         end
 

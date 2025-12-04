@@ -195,7 +195,7 @@ module Protovalidate
         end
 
         # Field-level CEL expressions
-        constraint.cel.each do |cel_rule|
+        constraint.cel.each_with_index do |cel_rule, cel_index|
           program = compile_cel_expression(cel_rule.expression, field.subtype || field, :field)
           rules << Rules::FieldCelRule.new(
             field: field,
@@ -203,7 +203,8 @@ module Protovalidate
             rule: cel_rule,
             cel_env: @cel_env,
             ignore: ignore,
-            oneof_name: oneof_name
+            oneof_name: oneof_name,
+            cel_index: cel_index
           )
         end
 
@@ -346,6 +347,16 @@ module Protovalidate
         rules << Rules::StringUriRefRule.new(field: field, ignore: ignore) if string_rules.uri_ref
         rules << Rules::StringUuidRule.new(field: field, ignore: ignore) if string_rules.uuid
         rules << Rules::StringHostAndPortRule.new(field: field, port_required: true, ignore: ignore) if string_rules.host_and_port
+
+        # Well-known regex patterns
+        if string_rules.well_known_regex && string_rules.well_known_regex != :KNOWN_REGEX_UNSPECIFIED
+          rules << Rules::StringWellKnownRegexRule.new(
+            field: field,
+            regex_type: string_rules.well_known_regex,
+            strict: string_rules.strict,
+            ignore: ignore
+          )
+        end
 
         rules
       end
