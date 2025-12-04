@@ -346,14 +346,28 @@ module Protovalidate
         rules << Rules::StringUriRule.new(field: field, ignore: ignore) if string_rules.uri
         rules << Rules::StringUriRefRule.new(field: field, ignore: ignore) if string_rules.uri_ref
         rules << Rules::StringUuidRule.new(field: field, ignore: ignore) if string_rules.uuid
+        rules << Rules::StringTuuidRule.new(field: field, ignore: ignore) if string_rules.tuuid
+        rules << Rules::StringAddressRule.new(field: field, ignore: ignore) if string_rules.address
         rules << Rules::StringHostAndPortRule.new(field: field, port_required: true, ignore: ignore) if string_rules.host_and_port
+
+        # IP with prefix length rules
+        rules << Rules::StringIpWithPrefixlenRule.new(field: field, version: 0, ignore: ignore) if string_rules.ip_with_prefixlen
+        rules << Rules::StringIpWithPrefixlenRule.new(field: field, version: 4, ignore: ignore) if string_rules.ipv4_with_prefixlen
+        rules << Rules::StringIpWithPrefixlenRule.new(field: field, version: 6, ignore: ignore) if string_rules.ipv6_with_prefixlen
+
+        # IP prefix rules (network address)
+        rules << Rules::StringIpPrefixRule.new(field: field, version: 0, ignore: ignore) if string_rules.ip_prefix
+        rules << Rules::StringIpPrefixRule.new(field: field, version: 4, ignore: ignore) if string_rules.ipv4_prefix
+        rules << Rules::StringIpPrefixRule.new(field: field, version: 6, ignore: ignore) if string_rules.ipv6_prefix
 
         # Well-known regex patterns
         if string_rules.well_known_regex && string_rules.well_known_regex != :KNOWN_REGEX_UNSPECIFIED
+          # strict defaults to true if not explicitly set
+          strict_value = string_rules.has_strict? ? string_rules.strict : true
           rules << Rules::StringWellKnownRegexRule.new(
             field: field,
             regex_type: string_rules.well_known_regex,
-            strict: string_rules.strict,
+            strict: strict_value,
             ignore: ignore
           )
         end

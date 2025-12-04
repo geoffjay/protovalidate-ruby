@@ -30,7 +30,9 @@ module Protovalidate
           len_bytes: 20, min_bytes: 4, max_bytes: 5,
           pattern: 6, prefix: 7, suffix: 8, contains: 9, not_contains: 23,
           in: 10, not_in: 11, email: 12, hostname: 13, ip: 14, ipv4: 15, ipv6: 16,
-          uri: 17, uri_ref: 18, address: 21, uuid: 22, host_and_port: 32
+          uri: 17, uri_ref: 18, address: 21, uuid: 22, well_known_regex: 24,
+          ip_with_prefixlen: 26, ipv4_with_prefixlen: 27, ipv6_with_prefixlen: 28,
+          ip_prefix: 29, ipv4_prefix: 30, ipv6_prefix: 31, host_and_port: 32, tuuid: 33
         }.freeze
 
         # Bytes rules field numbers
@@ -163,9 +165,13 @@ module Protovalidate
               :uint64
             when :pattern then :string
             when :prefix, :suffix, :contains, :not_contains then type_name == :bytes ? :bytes : :string
-            when :email, :hostname, :ip, :ipv4, :ipv6, :uri, :uri_ref, :address, :uuid,
+            when :email, :hostname, :ip, :ipv4, :ipv6, :uri, :uri_ref, :address, :uuid, :tuuid,
+                 :ip_with_prefixlen, :ipv4_with_prefixlen, :ipv6_with_prefixlen,
+                 :ip_prefix, :ipv4_prefix, :ipv6_prefix,
                  :host_and_port, :unique, :defined_only, :finite, :lt_now, :gt_now
               :bool
+            when :well_known_regex
+              :enum
             when :within then :message
             when :items, :keys, :values then :message
             else :message
@@ -1049,8 +1055,15 @@ module Protovalidate
 
           field_elem = build_field_path_element
           context.with_field_path_element(field_elem) do
+            # Add _empty suffix for string fields with empty values
+            constraint_id = if value.is_a?(String) && value.empty? && @constraint_id.start_with?("string.")
+                              "#{@constraint_id}_empty"
+                            else
+                              @constraint_id
+                            end
+
             violation = Violation.new(
-              constraint_id: @constraint_id,
+              constraint_id: constraint_id,
               message: @message,
               rule_path: @rule_path
             )
@@ -2045,6 +2058,273 @@ module Protovalidate
 
           port = port_str.to_i
           port >= 0 && port <= 65535
+        end
+      end
+
+      # Validates that a string is a valid address (hostname or IP).
+      class StringAddressRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.address",
+            message: "value must be a valid hostname, or ip address",
+            rule_path: RulePath.build(:string, :address)
+          )
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          constraint_id = value.empty? ? "string.address_empty" : @constraint_id
+
+          unless check_value(value)
+            field_elem = build_field_path_element
+
+            context.with_field_path_element(field_elem) do
+              violation = Violation.new(
+                constraint_id: constraint_id,
+                message: @message,
+                rule_path: @rule_path.dup
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+          valid_hostname?(value) || valid_ip?(value)
+        end
+
+        private
+
+        def valid_hostname?(str)
+          return false if str.empty?
+          return false if str.length > 253
+
+          # Reject if it looks like an IP address (all numeric labels)
+          labels = str.chomp(".").split(".")
+          return false if labels.all? { |l| l =~ /\A\d+\z/ }
+
+          # Hostname validation pattern
+          pattern = /\A(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?\z/
+          str.match?(pattern)
+        end
+
+        def valid_ip?(str)
+          require "ipaddr"
+          IPAddr.new(str)
+          true
+        rescue IPAddr::InvalidAddressError
+          false
+        end
+      end
+
+      # Validates that a string is a valid IP address with prefix length (CIDR).
+      class StringIpWithPrefixlenRule < DirectFieldRule
+        def initialize(field:, version: 0, ignore: :IGNORE_UNSPECIFIED)
+          rule_name = case version
+                      when 4 then :ipv4_with_prefixlen
+                      when 6 then :ipv6_with_prefixlen
+                      else :ip_with_prefixlen
+                      end
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.#{rule_name}",
+            message: "value must be a valid IP address with prefix length",
+            rule_path: RulePath.build(:string, rule_name)
+          )
+          @version = version
+          @rule_name = rule_name
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          constraint_id = value.empty? ? "string.#{@rule_name}_empty" : @constraint_id
+
+          unless check_value(value)
+            field_elem = build_field_path_element
+
+            context.with_field_path_element(field_elem) do
+              violation = Violation.new(
+                constraint_id: constraint_id,
+                message: @message,
+                rule_path: @rule_path.dup
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+          return false unless value.include?("/")
+
+          require "ipaddr"
+          parts = value.split("/")
+          return false unless parts.length == 2
+
+          begin
+            addr = IPAddr.new(parts[0])
+            prefix_len = parts[1].to_i
+
+            return false unless parts[1] =~ /\A\d+\z/
+
+            case @version
+            when 4
+              return false unless addr.ipv4?
+              return false if prefix_len.negative? || prefix_len > 32
+            when 6
+              return false unless addr.ipv6?
+              return false if prefix_len.negative? || prefix_len > 128
+            else
+              max_prefix = addr.ipv4? ? 32 : 128
+              return false if prefix_len.negative? || prefix_len > max_prefix
+            end
+
+            true
+          rescue IPAddr::InvalidAddressError
+            false
+          end
+        end
+      end
+
+      # Validates that a string is a valid IP prefix (network address with prefix length).
+      class StringIpPrefixRule < DirectFieldRule
+        def initialize(field:, version: 0, ignore: :IGNORE_UNSPECIFIED)
+          rule_name = case version
+                      when 4 then :ipv4_prefix
+                      when 6 then :ipv6_prefix
+                      else :ip_prefix
+                      end
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.#{rule_name}",
+            message: "value must be a valid IP prefix",
+            rule_path: RulePath.build(:string, rule_name)
+          )
+          @version = version
+          @rule_name = rule_name
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          constraint_id = value.empty? ? "string.#{@rule_name}_empty" : @constraint_id
+
+          unless check_value(value)
+            field_elem = build_field_path_element
+
+            context.with_field_path_element(field_elem) do
+              violation = Violation.new(
+                constraint_id: constraint_id,
+                message: @message,
+                rule_path: @rule_path.dup
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+          return false unless value.include?("/")
+
+          require "ipaddr"
+          parts = value.split("/")
+          return false unless parts.length == 2
+
+          begin
+            return false unless parts[1] =~ /\A\d+\z/
+
+            addr = IPAddr.new(parts[0])
+            prefix_len = parts[1].to_i
+
+            case @version
+            when 4
+              return false unless addr.ipv4?
+              return false if prefix_len.negative? || prefix_len > 32
+            when 6
+              return false unless addr.ipv6?
+              return false if prefix_len.negative? || prefix_len > 128
+            else
+              max_prefix = addr.ipv4? ? 32 : 128
+              return false if prefix_len.negative? || prefix_len > max_prefix
+            end
+
+            # Check that this is a proper network address (host bits are zero)
+            network = IPAddr.new("#{parts[0]}/#{prefix_len}")
+            network.to_s == addr.to_s
+          rescue IPAddr::InvalidAddressError
+            false
+          end
+        end
+      end
+
+      # Validates that a string is a valid TUUID (typed UUID).
+      class StringTuuidRule < DirectFieldRule
+        def initialize(field:, ignore: :IGNORE_UNSPECIFIED)
+          super(
+            field: field,
+            ignore: ignore,
+            constraint_id: "string.tuuid",
+            message: "value must be a valid typed UUID",
+            rule_path: RulePath.build(:string, :tuuid)
+          )
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+          return if should_ignore?(message, value)
+
+          constraint_id = value.empty? ? "string.tuuid_empty" : @constraint_id
+
+          unless check_value(value)
+            field_elem = build_field_path_element
+
+            context.with_field_path_element(field_elem) do
+              violation = Violation.new(
+                constraint_id: constraint_id,
+                message: @message,
+                rule_path: @rule_path.dup
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        end
+
+        protected
+
+        def check_value(value)
+          return false if value.empty?
+
+          # TUUID is 32 hex characters WITHOUT dashes (trimmed UUID)
+          value.match?(/\A[0-9a-fA-F]{32}\z/)
         end
       end
 
