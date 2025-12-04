@@ -365,6 +365,519 @@ module Protovalidate
         end
       end
 
+      # CEL rule for predefined validation constraints defined as extensions.
+      class PredefinedCelRule < Base
+        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, field_number: 1161,
+                       extension_name: nil, type_rules_field_number: 0, type_rules_field_name: "",
+                       extension_value: nil, extension_type: nil, extension_label: nil)
+          super()
+          @field = field
+          @program = program
+          @rule = rule
+          @cel_env = cel_env
+          @ignore = ignore
+          @field_number = field_number
+          @extension_name = extension_name
+          @type_rules_field_number = type_rules_field_number
+          @type_rules_field_name = type_rules_field_name
+          @extension_value = extension_value
+          @extension_type = extension_type
+          @extension_label = extension_label
+          @decoded_rule_value = decode_extension_value(extension_value, extension_type, extension_label)
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          value = message.send(@field.name)
+
+          # Handle ignore conditions
+          return if should_ignore?(message, value)
+
+          field_elem = build_field_path_element
+
+          context.with_field_path_element(field_elem) do
+            activation = CelHelpers.field_to_activation(value, @field)
+            # Add the rule value to the activation if we have one
+            activation[:rule] = CelHelpers.ruby_to_cel(@decoded_rule_value) if @decoded_rule_value
+            result = @program.evaluate(activation)
+
+            # Predefined rules return empty string for success, error message for failure
+            result_value = result.respond_to?(:value) ? result.value : result
+
+            # Check if validation failed (non-empty string means error message)
+            if result_value.is_a?(String) && !result_value.empty?
+              violation = Violation.new(
+                constraint_id: @rule.id || "",
+                message: result_value,
+                rule_path: build_predefined_rule_path
+              )
+              violation.field_value = value
+              context.add(violation)
+            elsif result_value == false
+              violation = Violation.new(
+                constraint_id: @rule.id || "",
+                message: @rule.message.to_s.empty? ? "predefined rule failed" : @rule.message,
+                rule_path: build_predefined_rule_path
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        rescue Cel::EvaluateError => e
+          raise RuntimeError.new("Predefined CEL evaluation failed for field '#{@field.name}': #{e.message}", cause: e)
+        end
+
+        private
+
+        def should_ignore?(message, value)
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
+          when :IGNORE_ALWAYS
+            true
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              empty_value?(value)
+            end
+          when :IGNORE_UNSPECIFIED
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              false
+            end
+          else
+            false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
+          end
+        end
+
+        def empty_value?(value)
+          return true if value.nil?
+
+          case value
+          when String then value.empty?
+          when Numeric then value.zero?
+          when FalseClass then true
+          when TrueClass then false
+          when Array, Google::Protobuf::RepeatedField then value.empty?
+          when Hash then value.empty?
+          when Google::Protobuf::Map then value.size.zero?
+          else
+            if value.is_a?(Google::Protobuf::MessageExts) && value.respond_to?(:to_h)
+              value.to_h.empty?
+            else
+              false
+            end
+          end
+        end
+
+        def build_field_path_element
+          FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: @field.type
+          )
+        end
+
+        def build_predefined_rule_path
+          # The rule path should have two elements (after finalization):
+          # 1. The type-specific rules field (e.g., field 14 "string" for StringRules)
+          # 2. The extension field with name formatted as [full.extension.name]
+          #
+          # Note: finalize_violations reverses the rule_path, so we build in reverse order
+          extension_field_name = @extension_name ? "[#{@extension_name}]" : ""
+
+          [
+            FieldPathElement.new(
+              field_number: @field_number,
+              field_name: extension_field_name,
+              field_type: @extension_type || :bool
+            ),
+            FieldPathElement.new(
+              field_number: @type_rules_field_number,
+              field_name: @type_rules_field_name,
+              field_type: :message
+            )
+          ]
+        end
+
+        # Decodes the binary extension value to the appropriate Ruby type
+        def decode_extension_value(value, field_type, field_label = nil)
+          return nil if value.nil?
+
+          # Handle repeated fields (packed encoding)
+          if field_label == :repeated
+            return decode_packed_values(value, field_type)
+          end
+
+          case field_type
+          when :float
+            # 32-bit float in little-endian
+            value.unpack1("e")
+          when :double
+            # 64-bit double in little-endian
+            value.unpack1("E")
+          when :int32, :sint32, :sfixed32
+            # 32-bit signed integer
+            value.is_a?(Integer) ? value : value.unpack1("l<")
+          when :int64, :sint64, :sfixed64
+            # 64-bit signed integer
+            value.is_a?(Integer) ? value : value.unpack1("q<")
+          when :uint32, :fixed32
+            # 32-bit unsigned integer
+            value.is_a?(Integer) ? value : value.unpack1("L<")
+          when :uint64, :fixed64
+            # 64-bit unsigned integer
+            value.is_a?(Integer) ? value : value.unpack1("Q<")
+          when :bool
+            # Boolean - varint 0 or 1
+            value.is_a?(Integer) ? value != 0 : value.unpack1("C") != 0
+          when :string, :bytes
+            # Already a string
+            value.is_a?(String) ? value : value.to_s
+          else
+            # For other types (enum, message), return as-is
+            value
+          end
+        end
+
+        # Decodes packed repeated values from binary data
+        def decode_packed_values(data, element_type)
+          return [] if data.nil? || data.empty?
+
+          results = []
+          data = data.b
+          pos = 0
+
+          case element_type
+          when :int32, :int64, :uint32, :uint64, :sint32, :sint64, :enum
+            # Varints
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              # Handle signed types
+              case element_type
+              when :sint32
+                value = (value >> 1) ^ -(value & 1)
+              when :sint64
+                value = (value >> 1) ^ -(value & 1)
+              when :int32
+                # Sign-extend 32-bit values
+                value = value > 0x7FFFFFFF ? value - 0x100000000 : value
+              end
+
+              results << value
+            end
+          when :fixed32, :sfixed32, :float
+            # 32-bit fixed
+            while pos + 4 <= data.bytesize
+              if element_type == :float
+                results << data[pos, 4].unpack1("e")
+              elsif element_type == :sfixed32
+                results << data[pos, 4].unpack1("l<")
+              else
+                results << data[pos, 4].unpack1("L<")
+              end
+              pos += 4
+            end
+          when :fixed64, :sfixed64, :double
+            # 64-bit fixed
+            while pos + 8 <= data.bytesize
+              if element_type == :double
+                results << data[pos, 8].unpack1("E")
+              elsif element_type == :sfixed64
+                results << data[pos, 8].unpack1("q<")
+              else
+                results << data[pos, 8].unpack1("Q<")
+              end
+              pos += 8
+            end
+          when :bool
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              results << (value != 0)
+            end
+          else
+            return data
+          end
+
+          results
+        end
+
+        def decode_varint(data, pos)
+          result = 0
+          shift = 0
+
+          loop do
+            return [nil, nil] if pos >= data.bytesize
+
+            byte = data.getbyte(pos)
+            pos += 1
+
+            result |= (byte & 0x7f) << shift
+
+            return [result, pos] if byte.nobits?(0x80)
+
+            shift += 7
+            return [nil, nil] if shift > 63
+          end
+        end
+      end
+
+      # CEL rule for predefined validation constraints on wrapper types (StringValue, etc.)
+      class WrapperPredefinedCelRule < Base
+        def initialize(field:, program:, rule:, cel_env:, ignore: :IGNORE_UNSPECIFIED, field_number: 1161,
+                       extension_name: nil, type_rules_field_number: 0, type_rules_field_name: "",
+                       extension_value: nil, extension_type: nil, extension_label: nil)
+          super()
+          @field = field
+          @program = program
+          @rule = rule
+          @cel_env = cel_env
+          @ignore = ignore
+          @field_number = field_number
+          @extension_name = extension_name
+          @type_rules_field_number = type_rules_field_number
+          @type_rules_field_name = type_rules_field_name
+          @extension_value = extension_value
+          @extension_type = extension_type
+          @extension_label = extension_label
+          @decoded_rule_value = decode_extension_value(extension_value, extension_type, extension_label)
+        end
+
+        def validate(context, message)
+          return if context.done?
+
+          wrapper = message.send(@field.name)
+
+          # Handle ignore conditions for the wrapper
+          return if should_ignore_wrapper?(message, wrapper)
+
+          # Unwrap the value
+          return if wrapper.nil?
+
+          value = wrapper.respond_to?(:value) ? wrapper.value : wrapper
+
+          field_elem = build_field_path_element
+
+          context.with_field_path_element(field_elem) do
+            # Create activation with unwrapped value
+            activation = { this: CelHelpers.ruby_to_cel(value), now: Time.now }
+            activation[:rule] = CelHelpers.ruby_to_cel(@decoded_rule_value) if @decoded_rule_value
+            result = @program.evaluate(activation)
+
+            result_value = result.respond_to?(:value) ? result.value : result
+
+            if result_value.is_a?(String) && !result_value.empty?
+              violation = Violation.new(
+                constraint_id: @rule.id || "",
+                message: result_value,
+                rule_path: build_predefined_rule_path
+              )
+              violation.field_value = value
+              context.add(violation)
+            elsif result_value == false
+              violation = Violation.new(
+                constraint_id: @rule.id || "",
+                message: @rule.message.to_s.empty? ? "predefined rule failed" : @rule.message,
+                rule_path: build_predefined_rule_path
+              )
+              violation.field_value = value
+              context.add(violation)
+            end
+          end
+        rescue Cel::EvaluateError => e
+          raise RuntimeError.new("Wrapper predefined CEL evaluation failed for field '#{@field.name}': #{e.message}", cause: e)
+        end
+
+        private
+
+        def should_ignore_wrapper?(message, wrapper)
+          ignore_value = normalize_ignore(@ignore)
+
+          case ignore_value
+          when :IGNORE_ALWAYS
+            true
+          when :IGNORE_IF_UNPOPULATED, :IGNORE_IF_DEFAULT_VALUE, :IGNORE_IF_ZERO_VALUE
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              wrapper.nil?
+            end
+          when :IGNORE_UNSPECIFIED
+            if message.respond_to?("has_#{@field.name}?")
+              !message.send("has_#{@field.name}?")
+            else
+              false
+            end
+          else
+            false
+          end
+        end
+
+        def normalize_ignore(ignore)
+          return ignore if ignore.is_a?(Symbol)
+
+          case ignore
+          when 0 then :IGNORE_UNSPECIFIED
+          when 1 then :IGNORE_IF_ZERO_VALUE
+          when 3 then :IGNORE_ALWAYS
+          else :IGNORE_UNSPECIFIED
+          end
+        end
+
+        def build_field_path_element
+          FieldPathElement.new(
+            field_number: @field.number,
+            field_name: @field.name,
+            field_type: @field.type
+          )
+        end
+
+        def build_predefined_rule_path
+          extension_field_name = @extension_name ? "[#{@extension_name}]" : ""
+
+          [
+            FieldPathElement.new(
+              field_number: @field_number,
+              field_name: extension_field_name,
+              field_type: @extension_type || :bool
+            ),
+            FieldPathElement.new(
+              field_number: @type_rules_field_number,
+              field_name: @type_rules_field_name,
+              field_type: :message
+            )
+          ]
+        end
+
+        def decode_extension_value(value, ext_type, ext_label = nil)
+          return nil if value.nil?
+
+          # Handle repeated fields (packed encoding)
+          if ext_label == :repeated
+            return decode_packed_values(value, ext_type)
+          end
+
+          case ext_type
+          when :float
+            value.unpack1("e")
+          when :double
+            value.unpack1("E")
+          when :int32, :sint32, :sfixed32
+            value.is_a?(Integer) ? value : value.unpack1("l<")
+          when :int64, :sint64, :sfixed64
+            value.is_a?(Integer) ? value : value.unpack1("q<")
+          when :uint32, :fixed32
+            value.is_a?(Integer) ? value : value.unpack1("L<")
+          when :uint64, :fixed64
+            value.is_a?(Integer) ? value : value.unpack1("Q<")
+          when :bool
+            value.is_a?(Integer) ? value != 0 : value.unpack1("C") != 0
+          when :string, :bytes
+            value.is_a?(String) ? value : value.to_s
+          else
+            value
+          end
+        end
+
+        # Decodes packed repeated values from binary data
+        def decode_packed_values(data, element_type)
+          return [] if data.nil? || data.empty?
+
+          results = []
+          data = data.b
+          pos = 0
+
+          case element_type
+          when :int32, :int64, :uint32, :uint64, :sint32, :sint64, :enum
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              case element_type
+              when :sint32
+                value = (value >> 1) ^ -(value & 1)
+              when :sint64
+                value = (value >> 1) ^ -(value & 1)
+              when :int32
+                value = value > 0x7FFFFFFF ? value - 0x100000000 : value
+              end
+
+              results << value
+            end
+          when :fixed32, :sfixed32, :float
+            while pos + 4 <= data.bytesize
+              if element_type == :float
+                results << data[pos, 4].unpack1("e")
+              elsif element_type == :sfixed32
+                results << data[pos, 4].unpack1("l<")
+              else
+                results << data[pos, 4].unpack1("L<")
+              end
+              pos += 4
+            end
+          when :fixed64, :sfixed64, :double
+            while pos + 8 <= data.bytesize
+              if element_type == :double
+                results << data[pos, 8].unpack1("E")
+              elsif element_type == :sfixed64
+                results << data[pos, 8].unpack1("q<")
+              else
+                results << data[pos, 8].unpack1("Q<")
+              end
+              pos += 8
+            end
+          when :bool
+            while pos < data.bytesize
+              value, pos = decode_varint(data, pos)
+              break if value.nil?
+
+              results << (value != 0)
+            end
+          else
+            return data
+          end
+
+          results
+        end
+
+        def decode_varint(data, pos)
+          result = 0
+          shift = 0
+
+          loop do
+            return [nil, nil] if pos >= data.bytesize
+
+            byte = data.getbyte(pos)
+            pos += 1
+
+            result |= (byte & 0x7f) << shift
+
+            return [result, pos] if byte.nobits?(0x80)
+
+            shift += 7
+            return [nil, nil] if shift > 63
+          end
+        end
+      end
+
       # Validates that a required field is present.
       class RequiredRule < Base
         def initialize(field:, ignore: :IGNORE_UNSPECIFIED)

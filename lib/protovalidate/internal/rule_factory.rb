@@ -5,6 +5,7 @@ require "ostruct"
 require_relative "rules"
 require_relative "cel_helpers"
 require_relative "constraint_resolver"
+require_relative "predefined_rules_resolver"
 
 module Protovalidate
   module Internal
@@ -275,6 +276,9 @@ module Protovalidate
       def compile_string_rules(field, string_rules, ignore, _oneof_name = nil)
         rules = []
 
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, string_rules, Buf::Validate::StringRules, ignore))
+
         # Const
         if string_rules.has_const?
           rules << Rules::StringConstRule.new(field: field, const: string_rules.const, ignore: ignore)
@@ -377,6 +381,9 @@ module Protovalidate
 
       def compile_bytes_rules(field, bytes_rules, ignore, _oneof_name = nil)
         rules = []
+
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, bytes_rules, Buf::Validate::BytesRules, ignore))
 
         # Const
         if bytes_rules.has_const?
@@ -506,17 +513,21 @@ module Protovalidate
 
       def compile_int_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
-        int_rules = case field.type
-                    when :int32 then constraint.int32
-                    when :int64 then constraint.int64
-                    when :sint32 then constraint.sint32
-                    when :sint64 then constraint.sint64
-                    when :sfixed32 then constraint.sfixed32
-                    when :sfixed64 then constraint.sfixed64
-                    end
+        int_rules, rules_class = case field.type
+                                 when :int32 then [constraint.int32, Buf::Validate::Int32Rules]
+                                 when :int64 then [constraint.int64, Buf::Validate::Int64Rules]
+                                 when :sint32 then [constraint.sint32, Buf::Validate::SInt32Rules]
+                                 when :sint64 then [constraint.sint64, Buf::Validate::SInt64Rules]
+                                 when :sfixed32 then [constraint.sfixed32, Buf::Validate::SFixed32Rules]
+                                 when :sfixed64 then [constraint.sfixed64, Buf::Validate::SFixed64Rules]
+                                 else [nil, nil]
+                                 end
         return rules unless int_rules
 
         type_name = field.type.to_s
+
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, int_rules, rules_class, ignore))
 
         # Handle combined range rules
         rules.concat(compile_numeric_range_rules(field, int_rules, ignore, type_name, oneof_name))
@@ -541,15 +552,19 @@ module Protovalidate
 
       def compile_uint_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
-        uint_rules = case field.type
-                     when :uint32 then constraint.uint32
-                     when :uint64 then constraint.uint64
-                     when :fixed32 then constraint.fixed32
-                     when :fixed64 then constraint.fixed64
-                     end
+        uint_rules, rules_class = case field.type
+                                  when :uint32 then [constraint.uint32, Buf::Validate::UInt32Rules]
+                                  when :uint64 then [constraint.uint64, Buf::Validate::UInt64Rules]
+                                  when :fixed32 then [constraint.fixed32, Buf::Validate::Fixed32Rules]
+                                  when :fixed64 then [constraint.fixed64, Buf::Validate::Fixed64Rules]
+                                  else [nil, nil]
+                                  end
         return rules unless uint_rules
 
         type_name = field.type.to_s
+
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, uint_rules, rules_class, ignore))
 
         # Handle combined range rules
         rules.concat(compile_numeric_range_rules(field, uint_rules, ignore, type_name, oneof_name))
@@ -574,13 +589,17 @@ module Protovalidate
 
       def compile_float_rules(field, constraint, ignore, oneof_name = nil)
         rules = []
-        float_rules = case field.type
-                      when :float then constraint.float
-                      when :double then constraint.double
-                      end
+        float_rules, rules_class = case field.type
+                                   when :float then [constraint.float, Buf::Validate::FloatRules]
+                                   when :double then [constraint.double, Buf::Validate::DoubleRules]
+                                   else [nil, nil]
+                                   end
         return rules unless float_rules
 
         type_name = field.type.to_s
+
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, float_rules, rules_class, ignore))
 
         # Handle combined range rules
         rules.concat(compile_numeric_range_rules(field, float_rules, ignore, type_name, oneof_name))
@@ -608,6 +627,9 @@ module Protovalidate
       def compile_bool_rules(field, bool_rules, ignore, oneof_name = nil)
         rules = []
 
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, bool_rules, Buf::Validate::BoolRules, ignore))
+
         if bool_rules.has_const?
           rules << Rules::BoolConstRule.new(field: field, const: bool_rules.const, ignore: ignore, oneof_name: oneof_name)
         end
@@ -617,6 +639,9 @@ module Protovalidate
 
       def compile_enum_rules(field, enum_rules, ignore, _oneof_name = nil)
         rules = []
+
+        # Compile predefined rules from extensions
+        rules.concat(compile_predefined_rules(field, enum_rules, Buf::Validate::EnumRules, ignore))
 
         # const rule
         if enum_rules.respond_to?(:has_const?) && enum_rules.has_const?
@@ -653,6 +678,19 @@ module Protovalidate
         rules.compact
       end
 
+      # Maps wrapper type names to their corresponding constraint field and rules class
+      WRAPPER_TYPE_INFO = {
+        "google.protobuf.StringValue" => { constraint_field: :string, rules_class: Buf::Validate::StringRules },
+        "google.protobuf.BytesValue" => { constraint_field: :bytes, rules_class: Buf::Validate::BytesRules },
+        "google.protobuf.BoolValue" => { constraint_field: :bool, rules_class: Buf::Validate::BoolRules },
+        "google.protobuf.Int32Value" => { constraint_field: :int32, rules_class: Buf::Validate::Int32Rules },
+        "google.protobuf.Int64Value" => { constraint_field: :int64, rules_class: Buf::Validate::Int64Rules },
+        "google.protobuf.UInt32Value" => { constraint_field: :uint32, rules_class: Buf::Validate::UInt32Rules },
+        "google.protobuf.UInt64Value" => { constraint_field: :uint64, rules_class: Buf::Validate::UInt64Rules },
+        "google.protobuf.FloatValue" => { constraint_field: :float, rules_class: Buf::Validate::FloatRules },
+        "google.protobuf.DoubleValue" => { constraint_field: :double, rules_class: Buf::Validate::DoubleRules }
+      }.freeze
+
       def compile_message_field_rules(field, constraint, ignore)
         rules = []
 
@@ -667,8 +705,17 @@ module Protovalidate
           when "google.protobuf.Timestamp"
             rules.concat(compile_timestamp_rules(field, constraint.timestamp, ignore)) if constraint.timestamp
           else
-            # Nested message validation
-            rules << Rules::SubMessageRule.new(field: field, factory: self)
+            # Check for wrapper types
+            wrapper_info = WRAPPER_TYPE_INFO[wkt_name]
+            if wrapper_info
+              type_rules = constraint.send(wrapper_info[:constraint_field])
+              if type_rules
+                rules.concat(compile_wrapper_predefined_rules(field, type_rules, wrapper_info[:rules_class], ignore))
+              end
+            else
+              # Nested message validation
+              rules << Rules::SubMessageRule.new(field: field, factory: self)
+            end
           end
         else
           # Nested message validation
@@ -1088,6 +1135,149 @@ module Protovalidate
       def compile_enum_item_rules(_field, _enum_rules, _ignore)
         # TODO: Implement enum item rules
         []
+      end
+
+      # Compiles predefined rules for wrapper types (StringValue, Int32Value, etc.)
+      #
+      # @param field [Google::Protobuf::FieldDescriptor] The wrapper field descriptor
+      # @param type_rules [Google::Protobuf::MessageExts] The type-specific rules (StringRules, BoolRules, etc.)
+      # @param rules_class [Class] The class of the type-specific rules
+      # @param ignore [Symbol] The ignore condition
+      # @return [Array<Rules::Base>] The compiled rules
+      def compile_wrapper_predefined_rules(field, type_rules, rules_class, ignore)
+        return [] if type_rules.nil? || rules_class.nil?
+
+        predefined = PredefinedRulesResolver.extract_predefined_rules(type_rules, rules_class)
+        return [] if predefined.empty?
+
+        type_rules_info = TYPE_RULES_FIELD_INFO[rules_class.name] || { field_number: 0, field_name: "" }
+
+        predefined.map do |rule_info|
+          build_wrapper_predefined_cel_rule(
+            field,
+            rule_info[:expression],
+            ignore,
+            rule_info[:id],
+            rule_info[:message],
+            rule_info[:field_number],
+            rule_info[:extension_name],
+            type_rules_info,
+            rule_info[:extension_value],
+            rule_info[:extension_type],
+            rule_info[:extension_label]
+          )
+        end.compact
+      end
+
+      # Builds a CEL rule for a predefined rule on a wrapper type
+      def build_wrapper_predefined_cel_rule(field, expression, ignore, constraint_id, message, field_number, extension_name, type_rules_info, extension_value = nil, extension_type = nil, extension_label = nil)
+        program = compile_cel_expression(expression, field, :field)
+        rule = OpenStruct.new(
+          id: constraint_id,
+          message: message,
+          expression: expression
+        )
+
+        Rules::WrapperPredefinedCelRule.new(
+          field: field,
+          program: program,
+          rule: rule,
+          cel_env: @cel_env,
+          ignore: ignore,
+          field_number: field_number,
+          extension_name: extension_name,
+          type_rules_field_number: type_rules_info[:field_number],
+          type_rules_field_name: type_rules_info[:field_name],
+          extension_value: extension_value,
+          extension_type: extension_type,
+          extension_label: extension_label
+        )
+      rescue StandardError => e
+        raise CompilationError.new("Failed to compile wrapper predefined CEL expression '#{expression}': #{e.message}", cause: e)
+      end
+
+      # Compiles predefined rules from type-specific rules extensions
+      #
+      # @param field [Google::Protobuf::FieldDescriptor] The field descriptor
+      # @param type_rules [Google::Protobuf::MessageExts] The type-specific rules (StringRules, BoolRules, etc.)
+      # @param rules_class [Class] The class of the type-specific rules
+      # @param ignore [Symbol] The ignore condition
+      # @return [Array<Rules::Base>] The compiled rules
+      # Mapping of rules class to the field info in FieldConstraints
+      TYPE_RULES_FIELD_INFO = {
+        "Buf::Validate::FloatRules" => { field_number: 1, field_name: "float" },
+        "Buf::Validate::DoubleRules" => { field_number: 2, field_name: "double" },
+        "Buf::Validate::Int32Rules" => { field_number: 3, field_name: "int32" },
+        "Buf::Validate::Int64Rules" => { field_number: 4, field_name: "int64" },
+        "Buf::Validate::UInt32Rules" => { field_number: 5, field_name: "uint32" },
+        "Buf::Validate::UInt64Rules" => { field_number: 6, field_name: "uint64" },
+        "Buf::Validate::SInt32Rules" => { field_number: 7, field_name: "sint32" },
+        "Buf::Validate::SInt64Rules" => { field_number: 8, field_name: "sint64" },
+        "Buf::Validate::Fixed32Rules" => { field_number: 9, field_name: "fixed32" },
+        "Buf::Validate::Fixed64Rules" => { field_number: 10, field_name: "fixed64" },
+        "Buf::Validate::SFixed32Rules" => { field_number: 11, field_name: "sfixed32" },
+        "Buf::Validate::SFixed64Rules" => { field_number: 12, field_name: "sfixed64" },
+        "Buf::Validate::BoolRules" => { field_number: 13, field_name: "bool" },
+        "Buf::Validate::StringRules" => { field_number: 14, field_name: "string" },
+        "Buf::Validate::BytesRules" => { field_number: 15, field_name: "bytes" },
+        "Buf::Validate::EnumRules" => { field_number: 16, field_name: "enum" },
+        "Buf::Validate::RepeatedRules" => { field_number: 18, field_name: "repeated" },
+        "Buf::Validate::MapRules" => { field_number: 19, field_name: "map" },
+        "Buf::Validate::AnyRules" => { field_number: 20, field_name: "any" },
+        "Buf::Validate::DurationRules" => { field_number: 21, field_name: "duration" },
+        "Buf::Validate::TimestampRules" => { field_number: 22, field_name: "timestamp" }
+      }.freeze
+
+      def compile_predefined_rules(field, type_rules, rules_class, ignore)
+        return [] if type_rules.nil? || rules_class.nil?
+
+        predefined = PredefinedRulesResolver.extract_predefined_rules(type_rules, rules_class)
+        return [] if predefined.empty?
+
+        type_rules_info = TYPE_RULES_FIELD_INFO[rules_class.name] || { field_number: 0, field_name: "" }
+
+        predefined.map do |rule_info|
+          build_predefined_cel_rule(
+            field,
+            rule_info[:expression],
+            ignore,
+            rule_info[:id],
+            rule_info[:message],
+            rule_info[:field_number],
+            rule_info[:extension_name],
+            type_rules_info,
+            rule_info[:extension_value],
+            rule_info[:extension_type],
+            rule_info[:extension_label]
+          )
+        end.compact
+      end
+
+      # Builds a CEL rule for a predefined rule expression
+      def build_predefined_cel_rule(field, expression, ignore, constraint_id, message, field_number, extension_name, type_rules_info, extension_value = nil, extension_type = nil, extension_label = nil)
+        program = compile_cel_expression(expression, field, :field)
+        rule = OpenStruct.new(
+          id: constraint_id,
+          message: message,
+          expression: expression
+        )
+
+        Rules::PredefinedCelRule.new(
+          field: field,
+          program: program,
+          rule: rule,
+          cel_env: @cel_env,
+          ignore: ignore,
+          field_number: field_number,
+          extension_name: extension_name,
+          type_rules_field_number: type_rules_info[:field_number],
+          type_rules_field_name: type_rules_info[:field_name],
+          extension_value: extension_value,
+          extension_type: extension_type,
+          extension_label: extension_label
+        )
+      rescue StandardError => e
+        raise CompilationError.new("Failed to compile predefined CEL expression '#{expression}': #{e.message}", cause: e)
       end
 
       def build_item_cel_rule(field, expression, ignore, constraint_id, message)
